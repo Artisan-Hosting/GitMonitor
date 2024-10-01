@@ -1,0 +1,25 @@
+[package]
+name = "git_monitor"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+artisan_middleware = "1.2.2"
+config = "0.14.0"
+dusa_collection_utils = "2.6.3"
+serde = "1.0.210"
+serde_json = "1.0.128"
+toml = "0.8.19"
+# Pretty printing
+simple_pretty = "0.1.0"
+tokio = "1.40.0"
+rng = "0.1.0"
+rand = "0.8.5"
+
+[[bin]]
+name = "git_monitor"
+path = "src/application/main.rs"
+
+[[bin]]
+name = "cli_credential"
+path = "src/cli/main.rs"
