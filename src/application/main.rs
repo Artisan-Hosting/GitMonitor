@@ -1,10 +1,7 @@
-use std::{thread, time::Duration};
+use std::{fmt::format, thread, time::Duration};
 
 use artisan_middleware::{
-    config::{AppConfig, GitConfig},
-    git_actions::{generate_git_project_path, GitCredentials},
-    state_persistence::{AppState, StatePersistence},
-    timestamp::current_timestamp,
+    config::{AppConfig, GitConfig}, git_actions::{generate_git_project_id, generate_git_project_path, GitCredentials}, log, logger::{get_log_level, set_log_level, LogLevel}, state_persistence::{AppState, StatePersistence}, timestamp::current_timestamp
 };
 use config::{get_config, specific_config};
 use dusa_collection_utils::{
@@ -24,41 +21,69 @@ async fn main() {
         specific_config();
     let git_credentials_result: Result<GitCredentials, ErrorArrayItem> =
         get_git_credentials(&config);
-    let mut state: AppState = get_initial_state(&config);
-    let state_path: PathType = PathType::Content(format!("/tmp/.{}.state", config.app_name));
 
-    // setting initial state
-    if let Err(err) = StatePersistence::save_state(&state, &state_path) {
-        state.error_log.push(ErrorArrayItem::new(
-            Errors::GeneralError,
-            format!("{}", err),
-        ));
-        println!("{:?}", state);
-        return;
+    // Loading initial state
+    let mut state: AppState = get_initial_state(&config);
+    let state_path: PathType = StatePersistence::get_state_path(&config);
+
+    // Setting log level
+    set_log_level(config.log_level);
+    if config.debug_mode{
+        log!(LogLevel::Info, "Loglevel: {}", get_log_level());
+    }
+
+    // Loading state information
+    match StatePersistence::load_state(&state_path) {
+        Ok(loaded_data) => {
+            log!(LogLevel::Debug, "Previous state data loaded");
+            state = loaded_data
+        },
+        Err(_) => {
+            log!(LogLevel::Warn, "No previous state file found, making new one at {}", state_path);
+            if let Err(err) = StatePersistence::save_state(&state, &state_path){
+                log!(LogLevel::Error, "Error occurred: {}", err.to_string())
+            }    
+        },
     };
 
     // Getting the specific config values
     let specific_config: config::AppSpecificConfig = match specific_config_result {
-        Ok(d) => d,
+        Ok(loaded_data) => {
+            log!(LogLevel::Debug, "Loaded Settings.toml");
+            loaded_data
+        },
         Err(e) => {
-            eprintln!("An error occoured");
+            log!(LogLevel::Error, "Failed to load GitMonitor.toml: {}", e.to_string());
             state
                 .error_log
                 .push(ErrorArrayItem::new(Errors::ReadingFile, e.to_string()));
-            let _ = StatePersistence::save_state(&state, &state_path);
+            update_state(&mut state, &state_path);
             return;
         }
     };
 
     // Ensuring we pulled the git credentials
     let git_credentials = match git_credentials_result {
-        Ok(d) => d,
+        Ok(loaded_data) => {
+            log!(LogLevel::Debug, "Loaded Git credentials");
+            loaded_data
+        },
         Err(e) => {
-            eprintln!("An error has occoured");
+            log!(LogLevel::Error, "Error while loading git credentials: {}", e.to_string());
             state.error_log.push(e);
-            let _ = StatePersistence::save_state(&state, &state_path);
+            update_state(&mut state, &state_path);
             return;
         }
+    };
+
+    // Debugging print statment
+    if config.debug_mode {
+        println!("RUNNING WITH DEBUGGING ENABLED");
+        println!("Loaded config: {}", config);
+        println!("Loaded specific config {}", specific_config);
+        println!("Git credentials loaded {}", git_credentials);
+        state.is_active = true;
+        println!("Current state: {}", state);
     };
 
     // Starting the application
@@ -81,6 +106,7 @@ async fn main() {
                 true => {
                     if let Err(err) = handle_existing_repo(&git_item_clone, &git_project_path).await
                     {
+                        log!(LogLevel::Warn, "{}", err);
                         state.error_log.push(err);
                         update_state(&mut state, &state_path);
                     }
@@ -90,6 +116,7 @@ async fn main() {
                         handle_new_repo(&git_item_clone, &git_item_clone.server, &git_project_path)
                             .await
                     {
+                        log!(LogLevel::Warn, "{}", err);
                         state.error_log.push(err);
                         update_state(&mut state, &state_path);
                     }
@@ -97,20 +124,23 @@ async fn main() {
             }
 
             state.event_counter += 1;
+            state.data = format!("Updated: {}", generate_git_project_id(&git_item));
             update_state(&mut state, &state_path);
         }
 
         thread::sleep(Duration::from_secs(specific_config.interval_seconds.into()));
     }
-
-    // println!("Done");
 }
 
 fn get_git_credentials(config: &AppConfig) -> Result<GitCredentials, ErrorArrayItem> {
-    let git_config: GitConfig = <std::option::Option<GitConfig> as Clone>::clone(&config.git)
-        .expect("Failed to load the git credentials file");
+    let git_config: GitConfig = match <std::option::Option<GitConfig> as Clone>::clone(&config.git){
+        Some(loaded_data) => loaded_data,
+        None => {
+            log!(LogLevel::Error, "Failed to load Git config data");
+            std::process::exit(0)
+        },
+    };
     let git_file: PathType = PathType::Str(git_config.credentials_file.into());
-
     GitCredentials::new(Some(&git_file))
 }
 
