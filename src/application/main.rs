@@ -1,4 +1,4 @@
-use std::{fmt::format, thread, time::Duration};
+use std::{thread, time::Duration};
 
 use artisan_middleware::{
     config::{AppConfig, GitConfig}, git_actions::{generate_git_project_id, generate_git_project_path, GitCredentials}, log, logger::{get_log_level, set_log_level, LogLevel}, state_persistence::{AppState, StatePersistence}, timestamp::current_timestamp
