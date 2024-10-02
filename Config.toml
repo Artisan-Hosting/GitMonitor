@@ -1,0 +1,7 @@
+[app_specific]
+# The interval, in seconds that we check for git updates
+interval_seconds = 30 
+
+[app_specific.git]
+credentials_file = "/etc/git_monitor/Credentials.cf"
+default_server = "GitHub"
