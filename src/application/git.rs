@@ -1,6 +1,9 @@
 use std::pin::Pin;
 
-use artisan_middleware::{git_actions::{GitAction, GitAuth, GitServer}, users::{get_id, set_file_ownership}};
+use artisan_middleware::{
+    git_actions::{GitAction, GitAuth, GitServer},
+    users::{get_id, set_file_ownership},
+};
 use dusa_collection_utils::{
     errors::{ErrorArrayItem, Errors},
     functions::{create_hash, truncate},

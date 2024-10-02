@@ -73,10 +73,17 @@ fn load_initial_state(config: &AppConfig, state_path: &PathType) -> AppState {
             loaded_data
         }
         Err(_) => {
-            log!(LogLevel::Warn, "No previous state file found, creating a new one");
+            log!(
+                LogLevel::Warn,
+                "No previous state file found, creating a new one"
+            );
             let state = get_initial_state(config);
             if let Err(err) = StatePersistence::save_state(&state, state_path) {
-                log!(LogLevel::Error, "Error occurred while saving new state: {}", err);
+                log!(
+                    LogLevel::Error,
+                    "Error occurred while saving new state: {}",
+                    err
+                );
             }
             state
         }
@@ -110,7 +117,11 @@ fn load_specific_config(state: &mut AppState, state_path: &PathType) -> Option<A
                 "Failed to load Overrides.toml: {}",
                 e.to_string()
             );
-            log_error(state, ErrorArrayItem::new(Errors::ReadingFile, e.to_string()), state_path);
+            log_error(
+                state,
+                ErrorArrayItem::new(Errors::ReadingFile, e.to_string()),
+                state_path,
+            );
             None
         }
     }

@@ -1,9 +1,12 @@
-use std::fmt;
-use artisan_middleware::{config::{AppConfig, GitConfig}, log, logger::LogLevel};
+use artisan_middleware::{
+    config::{AppConfig, GitConfig},
+    log,
+    logger::LogLevel,
+};
 use colored::Colorize;
 use config::{Config, ConfigError, File};
 use serde::Deserialize;
-
+use std::fmt;
 
 pub fn get_config() -> AppConfig {
     let mut config: AppConfig = match AppConfig::new() {
@@ -11,7 +14,7 @@ pub fn get_config() -> AppConfig {
         Err(e) => {
             log!(LogLevel::Error, "Couldn't load config: {}", e.to_string());
             std::process::exit(0)
-        },
+        }
     };
     config.app_name = env!("CARGO_PKG_NAME").to_string();
     config.version = env!("CARGO_PKG_VERSION").to_string();
@@ -25,7 +28,6 @@ pub struct AppSpecificConfig {
     pub interval_seconds: u32,
     pub git: Option<GitConfig>,
 }
-
 
 impl fmt::Display for AppSpecificConfig {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
