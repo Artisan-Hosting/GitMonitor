@@ -1,12 +1,7 @@
 use std::{thread, time::Duration};
 
 use artisan_middleware::{
-    config::AppConfig,
-    git_actions::{generate_git_project_id, generate_git_project_path, GitCredentials},
-    log,
-    logger::{get_log_level, set_log_level, LogLevel},
-    state_persistence::{AppState, StatePersistence},
-    timestamp::current_timestamp,
+    common::{log_error, update_state}, config::AppConfig, git_actions::{generate_git_project_id, generate_git_project_path, GitCredentials}, log, logger::{set_log_level, LogLevel}, state_persistence::{AppState, StatePersistence}, timestamp::current_timestamp
 };
 use config::{get_config, specific_config, AppSpecificConfig};
 use dusa_collection_utils::{
@@ -18,6 +13,7 @@ use rand::{rngs::StdRng, seq::SliceRandom, SeedableRng};
 
 mod config;
 mod git;
+mod pull;
 
 #[tokio::main]
 async fn main() {
@@ -25,9 +21,6 @@ async fn main() {
     let config: AppConfig = get_config();
     let state_path: PathType = StatePersistence::get_state_path(&config);
     let mut state: AppState = load_initial_state(&config, &state_path);
-
-    // Set log level
-    configure_logging(&config, &mut state, &state_path);
 
     // Load Override configuration
     let specific_config: AppSpecificConfig = match load_specific_config(&mut state, &state_path) {
@@ -45,6 +38,7 @@ async fn main() {
     };
 
     // Update state to indicate initialization
+    set_log_level(state.config.log_level);
     state.is_active = true;
     state.config.git = specific_config.git.clone();
     state.data = String::from("Git monitor is initialized");
@@ -68,8 +62,16 @@ async fn main() {
 // Load initial state, creating a new state if necessary
 fn load_initial_state(config: &AppConfig, state_path: &PathType) -> AppState {
     match StatePersistence::load_state(state_path) {
-        Ok(loaded_data) => {
+        Ok(mut loaded_data) => {
             log!(LogLevel::Debug, "Previous state data loaded");
+            loaded_data.config.debug_mode = config.debug_mode;
+            loaded_data.last_updated = current_timestamp();
+            // clearing errors from last run
+            loaded_data.error_log.clear();
+            loaded_data.is_active = true;
+            loaded_data.config.log_level = config.log_level;
+            update_state(&mut loaded_data, state_path);
+            log!(LogLevel::Trace, "Initial state has been updated from the config");
             loaded_data
         }
         Err(_) => {
@@ -88,18 +90,6 @@ fn load_initial_state(config: &AppConfig, state_path: &PathType) -> AppState {
             state
         }
     }
-}
-
-// Configure logging and update the state accordingly
-fn configure_logging(config: &AppConfig, state: &mut AppState, state_path: &PathType) {
-    if config.debug_mode {
-        set_log_level(LogLevel::Debug);
-    } else {
-        set_log_level(LogLevel::Info);
-    }
-    log!(LogLevel::Info, "Loglevel: {}", get_log_level());
-    state.config.debug_mode = config.debug_mode;
-    update_state(state, state_path);
 }
 
 // Load specific configuration and update the state in case of errors
@@ -167,26 +157,6 @@ async fn process_git_repositories(
             update_state(state, state_path);
         }
     }
-}
-
-// Update state and persist it to disk
-fn update_state(state: &mut AppState, path: &PathType) {
-    state.last_updated = current_timestamp();
-    if let Err(err) = StatePersistence::save_state(state, path) {
-        log!(LogLevel::Error, "Failed to save state: {}", err);
-        state.is_active = false;
-        state.error_log.push(ErrorArrayItem::new(
-            Errors::GeneralError,
-            format!("{}", err),
-        ));
-    }
-}
-
-// Log an error and update the state
-fn log_error(state: &mut AppState, error: ErrorArrayItem, path: &PathType) {
-    log!(LogLevel::Error, "{}", error);
-    state.error_log.push(error);
-    update_state(state, path);
 }
 
 // Create an initial state
