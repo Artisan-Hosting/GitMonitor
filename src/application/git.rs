@@ -14,6 +14,8 @@ pub async fn handle_existing_repo(
     git_project_path: &PathType,
 ) -> Result<(), ErrorArrayItem> {
     log!(LogLevel::Trace, "Working on existing git repo {}", auth.generate_id());
+    // set_safe_directory(git_project_path).await?;
+    fetch_updates(git_project_path).await?;
 
     if is_upstream_ahead(auth, git_project_path).await? {
         let new_data_downloaded = match pull_updates(auth, git_project_path).await {
