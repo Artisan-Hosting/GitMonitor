@@ -1,4 +1,4 @@
-use std::{thread, time::Duration};
+use std::{sync::{atomic::{AtomicBool, Ordering}, Arc}, thread, time::Duration};
 
 use artisan_middleware::{
     common::{log_error, update_state}, config::AppConfig, git_actions::{generate_git_project_id, generate_git_project_path, GitCredentials}, log, logger::{set_log_level, LogLevel}, state_persistence::{AppState, StatePersistence}, timestamp::current_timestamp
@@ -10,20 +10,28 @@ use dusa_collection_utils::{
 };
 use git::{handle_existing_repo, handle_new_repo};
 use rand::{rngs::StdRng, seq::SliceRandom, SeedableRng};
+use signals::sighup_watch;
 
 mod config;
 mod git;
 mod pull;
+mod signals;
 
 #[tokio::main]
 async fn main() {
     // Initialization
-    let config: AppConfig = get_config();
+
+    // Loading configs 
+    let mut config: AppConfig = get_config();
     let state_path: PathType = StatePersistence::get_state_path(&config);
     let mut state: AppState = load_initial_state(&config, &state_path);
 
+    // loading signal handeling
+    let reload: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    sighup_watch(reload.clone());
+
     // Load Override configuration
-    let specific_config: AppSpecificConfig = match load_specific_config(&mut state, &state_path) {
+    let mut specific_config: AppSpecificConfig = match load_specific_config(&mut state, &state_path) {
         Some(cfg) => cfg,
         None => return, // Exit on failure
     };
@@ -54,7 +62,30 @@ async fn main() {
 
     // Main loop
     loop {
+        // Reloading block
+        if reload.load(Ordering::Relaxed) {
+            log!(LogLevel::Debug, "Reloading config");
+
+            // Getting the new data
+            config = get_config();
+            state = load_initial_state(&config, &state_path);
+
+
+            specific_config = match load_specific_config(&mut state, &state_path) {
+                Some(cfg) => cfg,
+                None => return, // Exit on failure
+            };
+
+            update_state(&mut state, &state_path);
+
+            log!(LogLevel::Debug, "Reloaded config");
+            reload.store(false, Ordering::Relaxed);
+        }
+        
+        // Application logic
         process_git_repositories(&git_credentials, &mut state, &state_path).await;
+
+        // sleep based on config
         thread::sleep(Duration::from_secs(specific_config.interval_seconds.into()));
     }
 }

@@ -17,6 +17,8 @@ tokio = "1.40.0"
 rng = "0.1.0"
 rand = "0.8.5"
 colored = "2.1.0"
+signals = "0.0.5"
+signal-hook = "0.3.17"
 
 [[bin]]
 name = "git_monitor"
