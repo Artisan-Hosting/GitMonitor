@@ -3,6 +3,7 @@ use std::{sync::{atomic::{AtomicBool, Ordering}, Arc}, thread, time::Duration};
 use artisan_middleware::{
     common::{log_error, update_state}, config::AppConfig, git_actions::{generate_git_project_id, generate_git_project_path, GitCredentials}, log, logger::{set_log_level, LogLevel}, state_persistence::{AppState, StatePersistence}, timestamp::current_timestamp
 };
+use colored::Colorize;
 use config::{get_config, specific_config, AppSpecificConfig};
 use dusa_collection_utils::{
     errors::{ErrorArrayItem, Errors},
@@ -11,6 +12,7 @@ use dusa_collection_utils::{
 use git::{handle_existing_repo, handle_new_repo};
 use rand::{rngs::StdRng, seq::SliceRandom, SeedableRng};
 use signals::sighup_watch;
+use simple_pretty::output;
 
 mod config;
 mod git;
@@ -73,7 +75,7 @@ async fn main() {
 
             specific_config = match load_specific_config(&mut state, &state_path) {
                 Some(cfg) => cfg,
-                None => return, // Exit on failure
+                None => break, // Exit on failure
             };
 
             update_state(&mut state, &state_path);
@@ -88,6 +90,10 @@ async fn main() {
         // sleep based on config
         thread::sleep(Duration::from_secs(specific_config.interval_seconds.into()));
     }
+
+    let msg = "Error occurred while reloading application";
+    println!("{}", msg.red().bold());
+    std::process::exit(100);
 }
 
 // Load initial state, creating a new state if necessary
