@@ -1,3 +1,11 @@
 # Overrides for the default config from the lib
 
 debug_mode = true
+log_level = "Trace"
+
+[git]
+default_server = "GitHub"
+credentials_file = "/tmp/git.recs"
+
+[aggregator]
+socket_path = "/tmp/test.sock"

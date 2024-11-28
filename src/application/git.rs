@@ -1,10 +1,12 @@
 use artisan_middleware::{
-    git_actions::{GitAction, GitAuth, GitServer}, log, logger::LogLevel, users::{get_id, set_file_ownership}
+    git_actions::{GitAction, GitAuth, GitServer}, users::{get_id, set_file_ownership}
 };
 use dusa_collection_utils::{
     errors::{ErrorArrayItem, Errors},
     types::{ClonePath, PathType},
 };
+use dusa_collection_utils::log;
+use dusa_collection_utils::log::LogLevel;
 
 use crate::pull::pull_updates;
 

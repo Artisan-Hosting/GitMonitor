@@ -1,8 +1,6 @@
-use artisan_middleware::{
-    git_actions::{GitAction, GitAuth},
-    log,
-    logger::LogLevel,
-};
+use artisan_middleware::git_actions::{GitAction, GitAuth};
+use dusa_collection_utils::log;
+use dusa_collection_utils::log::LogLevel;
 use dusa_collection_utils::{
     errors::{ErrorArray, ErrorArrayItem, Errors},
     types::PathType,
@@ -16,6 +14,7 @@ const MAX_RETRIES: u8 = 3; // Maximum number of retries
 const RETRY_DELAY_SECS: u64 = 3; // Delay between retries in seconds
 
 pub async fn pull_updates(auth: &GitAuth, git_project_path: &PathType) -> Result<bool, ErrorArray> {
+    log!(LogLevel::Trace, "Starting update for {}", auth.generate_id());
     let error_array = &mut ErrorArray::new_container();
     let mut retries = 0;
 
@@ -25,6 +24,7 @@ pub async fn pull_updates(auth: &GitAuth, git_project_path: &PathType) -> Result
             destination: git_project_path.clone(),
         };
 
+        log!(LogLevel::Trace, "Pulling: {}", auth.generate_id());
         match pull_update.execute().await {
             Ok(output) => {
                 let hpo = handle_pull_output(output);
@@ -75,11 +75,14 @@ fn handle_pull_output(output: Option<Output>) -> Result<bool, ErrorArrayItem> {
     if let Some(data) = output {
         let stdout_str = String::from_utf8_lossy(&data.stdout);
         if stdout_str.contains("Already up to date.") {
+            log!(LogLevel::Trace, "Already up to date");
             Ok(false) // No new data was pulled
         } else {
+            log!(LogLevel::Trace, "Updated");
             Ok(true) // New data was pulled
         }
     } else {
+        log!(LogLevel::Trace, "Git cli returned no output");
         Ok(false) // No data was available
     }
 }
