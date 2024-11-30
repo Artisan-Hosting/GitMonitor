@@ -70,7 +70,8 @@ async fn main() {
         log!(LogLevel::Debug, "Git credentials loaded {}", git_credentials);
         set_log_level(state.config.log_level);
     };
-    simple_pretty::output("GREEN", "Git monitor initialized");
+    
+    log!(LogLevel::Info, "Git monitor initialized");
 
     // Main loop
     loop {

@@ -887,7 +887,6 @@ dependencies = [
  "serde_json",
  "signal-hook",
  "signals",
- "simple_pretty",
  "tokio",
  "toml 0.8.19",
 ]
