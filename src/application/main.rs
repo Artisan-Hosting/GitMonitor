@@ -40,7 +40,6 @@ async fn main() {
     let mut config: AppConfig = get_config();
     let state_path: PathType = StatePersistence::get_state_path(&config);
     let mut state: AppState = load_initial_state(&config, &state_path).await;
-    set_log_level(LogLevel::Trace);
     if let Err(err) = register_app(&state).await {
         log!(LogLevel::Error, "Failed to register app: {}", err);
     };
@@ -60,15 +59,16 @@ async fn main() {
     };
 
     // Update state to indicate initialization
-    set_log_level(state.config.log_level);
     state.is_active = true;
     state.config.git = config.git.clone();
     state.data = String::from("Git monitor is initialized");
     update_state(&mut state, &state_path).await;
 
     if config.debug_mode {
-        println!("Loaded Initial Config: {}", config);
-        println!("Git credentials loaded {}", git_credentials);
+        set_log_level(LogLevel::Debug);
+        log!(LogLevel::Debug, "Loaded Initial Config: {}", config);
+        log!(LogLevel::Debug, "Git credentials loaded {}", git_credentials);
+        set_log_level(state.config.log_level);
     };
     simple_pretty::output("GREEN", "Git monitor initialized");
 
@@ -109,6 +109,8 @@ async fn load_initial_state(config: &AppConfig, state_path: &PathType) -> AppSta
             loaded_data.config.log_level = config.log_level;
             loaded_data.config.aggregator = config.aggregator.clone();
             loaded_data.config.git = config.git.clone();
+            loaded_data.config.log_level = config.log_level;
+            set_log_level(loaded_data.config.log_level);
             log!(
                 LogLevel::Trace,
                 "Initial state has been updated from the config"
@@ -116,6 +118,7 @@ async fn load_initial_state(config: &AppConfig, state_path: &PathType) -> AppSta
             loaded_data
         }
         Err(_) => {
+            // this was a weird way to initalize this but it retains the config info
             log!(
                 LogLevel::Warn,
                 "No previous state file found, creating a new one"
@@ -128,6 +131,7 @@ async fn load_initial_state(config: &AppConfig, state_path: &PathType) -> AppSta
                     err
                 );
             }
+            set_log_level(state.config.log_level);
             state
         }
     }
