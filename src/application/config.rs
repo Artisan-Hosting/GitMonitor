@@ -1,5 +1,6 @@
 use artisan_middleware::config::AppConfig;
-use dusa_collection_utils::version::SoftwareVersion;
+use artisan_middleware::version::{aml_version, str_to_version};
+use dusa_collection_utils::version::{SoftwareVersion, Version, VersionCode};
 use dusa_collection_utils::{log, stringy::Stringy};
 use dusa_collection_utils::log::LogLevel;
 
@@ -11,9 +12,27 @@ pub fn get_config() -> AppConfig {
             std::process::exit(0)
         }
     };
-    let version = SoftwareVersion::dummy();
+
+    let raw_version: SoftwareVersion = {
+        // defining the version
+        let library_version: Version = aml_version();
+        let software_version: Version = str_to_version(env!("CARGO_PKG_VERSION"), Some(VersionCode::Production));
+        
+        SoftwareVersion {
+            application: software_version,
+            library: library_version,
+        }
+    };
+
+    config.version = match serde_json::to_string(&raw_version) {
+        Ok(ver) => ver,
+        Err(err) => {
+            log!(LogLevel::Error, "{}", err);
+            std::process::exit(100);
+        },
+    };
+
     config.app_name = Stringy::from(env!("CARGO_PKG_NAME"));
-    config.version = version.to_string();
     config.database = None;
     config
 }
