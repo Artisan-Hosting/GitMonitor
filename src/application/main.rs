@@ -43,7 +43,7 @@ async fn main() {
     if let Err(err) = register_app(&state).await {
         log!(LogLevel::Error, "Failed to register app: {}", err);
     };
-    update_state(&mut state, &state_path).await;
+    update_state(&mut state, &state_path, None).await;
 
     // loading signal handeling
     let reload: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
@@ -62,7 +62,7 @@ async fn main() {
     state.is_active = true;
     state.config.git = config.git.clone();
     state.data = String::from("Git monitor is initialized");
-    update_state(&mut state, &state_path).await;
+    update_state(&mut state, &state_path, None).await;
 
     if config.debug_mode {
         set_log_level(LogLevel::Debug);
@@ -83,7 +83,7 @@ async fn main() {
             config = get_config();
             state = load_initial_state(&config, &state_path).await;
 
-            update_state(&mut state, &state_path).await;
+            update_state(&mut state, &state_path, None).await;
 
             log!(LogLevel::Debug, "Reloaded config");
             reload.store(false, Ordering::Relaxed);
@@ -175,7 +175,7 @@ async fn process_git_repositories(
         } else {
             state.event_counter += 1;
             state.data = format!("Updated: {}", generate_git_project_id(&git_item));
-            update_state(state, state_path).await;
+            update_state(state, state_path, None).await;
         }
     }
 }
