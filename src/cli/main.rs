@@ -6,7 +6,7 @@ use artisan_middleware::{
 };
 use dusa_collection_utils::log;
 use dusa_collection_utils::{
-    errors::{ErrorArrayItem, Errors},
+    errors::ErrorArrayItem,
     log::{LogLevel, set_log_level},
     stringy::Stringy,
     types::PathType,
@@ -53,10 +53,10 @@ async fn get_git_credentials(config: &AppConfig) -> Result<GitCredentials, Error
             let git_file: PathType = PathType::Str(git_config.credentials_file.clone().into());
             GitCredentials::new(Some(&git_file)).await
         }
-        None => Err(ErrorArrayItem::new(
-            Errors::ReadingFile,
-            "Git configuration not found".to_string(),
-        )),
+        None => {
+            let git_file: PathType = PathType::Stringy(Stringy::from("/etc/git_monitor/Credentials.cf"));
+            GitCredentials::new(Some(&git_file)).await
+        },
     }
 }
 
