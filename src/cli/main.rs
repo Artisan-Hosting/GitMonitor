@@ -7,7 +7,7 @@ use artisan_middleware::{
 use dusa_collection_utils::log;
 use dusa_collection_utils::{
     errors::{ErrorArrayItem, Errors},
-    log::LogLevel,
+    log::{LogLevel, set_log_level},
     stringy::Stringy,
     types::PathType,
     version::{SoftwareVersion, Version, VersionCode},
@@ -114,7 +114,8 @@ async fn main() {
         match choice.as_str() {
             "1" => {
                 for git in git_credentials.to_vec() {
-                    log!(LogLevel::Info, "{}", git);
+                    let id = git.generate_id();
+                    log!(LogLevel::Info, "{}\nId: {}", git, id);
                 }
                 log!(LogLevel::Info, "Done");
                 std::process::exit(0)
@@ -227,6 +228,11 @@ async fn main() {
                 }
 
                 std::process::exit(0)
+            }
+            "or" => {
+                set_log_level(LogLevel::Debug);
+                log!(LogLevel::Debug, "No \" or \" isn't actually an option dumbass");
+                set_log_level(config.log_level);
             }
             _ => {
                 println!("Invalid choice. Please enter 1, 2, 3 or 4.");
