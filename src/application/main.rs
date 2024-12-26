@@ -107,7 +107,6 @@ async fn load_initial_state(config: &AppConfig, state_path: &PathType) -> AppSta
             // clearing errors from last run
             loaded_data.error_log.clear();
             loaded_data.event_counter = 0;
-            loaded_data.last_updated = current_timestamp();
             loaded_data.is_active = true;
             loaded_data.config.log_level = config.log_level;
             loaded_data.config.aggregator = config.aggregator.clone();
