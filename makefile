@@ -1,7 +1,7 @@
 # Variables
-APP_NAME = git_monitor
+APP_NAME = ais_gitmon
 SERVICE_FILE = /etc/systemd/system/$(APP_NAME).service
-BIN_DIR = /usr/local/bin
+BIN_DIR = /opt/artisan/bin/
 CONFIG_DIR = /etc/$(APP_NAME)
 
 # Build binaries

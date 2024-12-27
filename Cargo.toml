@@ -1,5 +1,5 @@
 [package]
-name = "git_monitor"
+name = "ais_gitmon"
 version = "2.1.2"
 edition = "2021"
 
@@ -19,7 +19,7 @@ signals = "0.0.5"
 signal-hook = "0.3.17"
 
 [[bin]]
-name = "git_monitor"
+name = "ais_gitmon"
 path = "src/application/main.rs"
 
 [[bin]]
