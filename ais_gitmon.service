@@ -8,6 +8,7 @@ User=root
 Group=root
 ExecStart=/opt/artisan/bin/ais_gitmon
 ExecReload=/bin/kill -SIGHUP $MAINPID
+KillSignal=SIGUSR1
 WorkingDirectory=/etc/ais_gitmon
 StandardOutput=file:/var/log/ais_gitmon.log
 StandardError=file:/var/log/ais_gitmon.log
