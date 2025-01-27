@@ -8,7 +8,7 @@ use std::{
 };
 
 use artisan_middleware::{
-    aggregator::register_app,
+    aggregator::{register_app, Status},
     common::{log_error, update_state},
     config::AppConfig,
     git_actions::{generate_git_project_id, generate_git_project_path, GitCredentials},
@@ -59,9 +59,9 @@ async fn main() {
     };
 
     // Update state to indicate initialization
-    state.is_active = true;
     state.config.git = config.git.clone();
     state.data = String::from("Git monitor is initialized");
+    state.status = Status::Running;
     update_state(&mut state, &state_path, None).await;
 
     if config.debug_mode {
@@ -107,12 +107,12 @@ async fn load_initial_state(config: &AppConfig, state_path: &PathType) -> AppSta
             // clearing errors from last run
             loaded_data.error_log.clear();
             loaded_data.event_counter = 0;
-            loaded_data.is_active = true;
             loaded_data.config.log_level = config.log_level;
             loaded_data.config.aggregator = config.aggregator.clone();
             loaded_data.config.git = config.git.clone();
             loaded_data.config.log_level = config.log_level;
             loaded_data.config.version = config.version.clone();
+            loaded_data.status = Status::Starting;
             set_log_level(loaded_data.config.log_level);
             log!(
                 LogLevel::Trace,
@@ -126,7 +126,8 @@ async fn load_initial_state(config: &AppConfig, state_path: &PathType) -> AppSta
                 LogLevel::Warn,
                 "No previous state file found, creating a new one"
             );
-            let state = get_initial_state(config);
+            let mut state = get_initial_state(config);
+            state.status = Status::Starting;
             if let Err(err) = StatePersistence::save_state(&state, state_path).await {
                 log!(
                     LogLevel::Error,
@@ -188,11 +189,11 @@ fn get_initial_state(config: &AppConfig) -> AppState {
         data: String::new(),
         last_updated: current_timestamp(),
         event_counter: 0,
-        is_active: false,
         error_log: vec![],
         config: config.clone(),
         name: config.app_name.to_string(),
         version: SoftwareVersion::dummy(),
         system_application: true,
+        status: Status::Unknown,
     }
 }
