@@ -1,0 +1,18 @@
+[Unit]
+Description=Git Monitor Service
+After=network.target
+
+[Service]
+Type=simple
+User=dwhitfield
+Group=dwhitfield
+ExecStart=/usr/bin/git_monitor
+ExecReload=/bin/kill -SIGHUP $MAINPID
+WorkingDirectory=/etc/git_monitor
+StandardOutput=file:/var/log/git_monitor.log
+StandardError=file:/var/log/git_monitor.log
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

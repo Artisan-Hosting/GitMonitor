@@ -46,7 +46,7 @@ async fn main() {
         Ok(credentials) => credentials,
         Err(e) => {
             log_error(&mut state, e, &state_path).await;
-            return; // Exit on failure
+            std::process::exit(100)
         }
     };
 
