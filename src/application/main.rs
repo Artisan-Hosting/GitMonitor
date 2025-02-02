@@ -84,6 +84,9 @@ async fn main() {
             }
 
             _ = exit_graceful.notified() => {
+                state.data = String::from("Git monitor exiting");
+                state.status = Status::Stopped;
+                update_state(&mut state, &state_path, None).await;
                 log!(LogLevel::Info, "Shutting down gracefully");
                 process_git_repositories(&git_credentials, &mut state, &state_path).await;
                 std::process::exit(0)
