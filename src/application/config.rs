@@ -1,7 +1,6 @@
 use artisan_middleware::aggregator::Status;
-use artisan_middleware::common::update_state;
 use artisan_middleware::config::AppConfig;
-use artisan_middleware::state_persistence::{self, AppState, StatePersistence};
+use artisan_middleware::state_persistence::{self, AppState, StatePersistence, update_state};
 use artisan_middleware::timestamp::current_timestamp;
 use artisan_middleware::version::{aml_version, str_to_version};
 use dusa_collection_utils::types::PathType;
@@ -55,6 +54,7 @@ pub async fn generate_state(config: &AppConfig) -> AppState {
             loaded_data.config.log_level = config.log_level;
             loaded_data.config.aggregator = config.aggregator.clone();
             loaded_data.config.environment = config.environment.clone();
+            loaded_data.stared_at = current_timestamp();
             loaded_data.pid = std::process::id();
             set_log_level(loaded_data.config.log_level);
             loaded_data.event_counter = 0;
@@ -73,6 +73,7 @@ pub async fn generate_state(config: &AppConfig) -> AppState {
                 version: SoftwareVersion::dummy(),
                 data: String::new(),
                 last_updated: current_timestamp(),
+                stared_at: current_timestamp(),
                 event_counter: 0,
                 pid: std::process::id(),
                 error_log: vec![],

@@ -2,10 +2,9 @@ use std::{sync::Arc, time::Duration};
 
 use artisan_middleware::{
     aggregator::Status,
-    common::{log_error, update_state},
     config::AppConfig,
     git_actions::{generate_git_project_id, generate_git_project_path, GitCredentials},
-    state_persistence::{AppState, StatePersistence},
+    state_persistence::{AppState, StatePersistence, log_error, update_state},
 };
 use config::{generate_state, get_config};
 use dusa_collection_utils::log;
