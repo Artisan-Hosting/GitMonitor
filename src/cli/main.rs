@@ -2,7 +2,6 @@ use artisan_middleware::{
     cli::{get_user_input, get_user_selection},
     config::AppConfig,
     git_actions::{GitAuth, GitCredentials, GitServer},
-    version::{aml_version, str_to_version},
 };
 use dusa_collection_utils::log;
 use dusa_collection_utils::{
@@ -10,7 +9,6 @@ use dusa_collection_utils::{
     log::{LogLevel, set_log_level},
     stringy::Stringy,
     types::PathType,
-    version::{SoftwareVersion, Version, VersionCode},
 };
 
 pub fn get_config() -> AppConfig {
