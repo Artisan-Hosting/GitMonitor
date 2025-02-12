@@ -1,9 +1,9 @@
 use artisan_middleware::git_actions::{GitAction, GitAuth};
 use dusa_collection_utils::log;
-use dusa_collection_utils::log::LogLevel;
+use dusa_collection_utils::logger::LogLevel;
 use dusa_collection_utils::{
     errors::{ErrorArray, ErrorArrayItem, Errors},
-    types::PathType,
+    types::pathtype::PathType,
 };
 use std::{process::Output, time::Duration};
 use tokio::time::sleep;

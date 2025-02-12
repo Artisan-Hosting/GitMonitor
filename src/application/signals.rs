@@ -1,5 +1,5 @@
 use dusa_collection_utils::log;
-use dusa_collection_utils::log::LogLevel;
+use dusa_collection_utils::logger::LogLevel;
 use signal_hook::{
     consts::{signal::SIGHUP, SIGUSR1},
     iterator::Signals,

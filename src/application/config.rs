@@ -1,11 +1,12 @@
 use artisan_middleware::aggregator::Status;
 use artisan_middleware::config::AppConfig;
-use artisan_middleware::state_persistence::{self, AppState, StatePersistence, update_state};
+use artisan_middleware::state_persistence::{self, update_state, AppState, StatePersistence};
 use artisan_middleware::timestamp::current_timestamp;
-use dusa_collection_utils::types::PathType;
+use dusa_collection_utils::log;
+use dusa_collection_utils::logger::{set_log_level, LogLevel};
+use dusa_collection_utils::types::pathtype::PathType;
+use dusa_collection_utils::types::stringy::Stringy;
 use dusa_collection_utils::version::SoftwareVersion;
-use dusa_collection_utils::{log, stringy::Stringy};
-use dusa_collection_utils::log::{set_log_level, LogLevel};
 
 pub fn get_config() -> AppConfig {
     let mut config: AppConfig = match AppConfig::new() {
@@ -22,7 +23,7 @@ pub fn get_config() -> AppConfig {
 
 pub async fn generate_state(config: &AppConfig) -> AppState {
     let state_path: PathType = get_state_path(&config);
-    
+
     match StatePersistence::load_state(&state_path).await {
         Ok(mut loaded_data) => {
             log!(LogLevel::Info, "Loaded previous state data");
@@ -59,6 +60,8 @@ pub async fn generate_state(config: &AppConfig) -> AppState {
                 config: config.clone(),
                 system_application: true,
                 status: Status::Starting,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
             };
             state.data = String::from("Initializing");
             state.config.debug_mode = true;

@@ -8,10 +8,10 @@ use artisan_middleware::{
 };
 use config::{generate_state, get_config};
 use dusa_collection_utils::log;
-use dusa_collection_utils::log::{set_log_level, LogLevel};
+use dusa_collection_utils::logger::{set_log_level, LogLevel};
 use dusa_collection_utils::{
     errors::{ErrorArrayItem, Errors},
-    types::PathType,
+    types::pathtype::PathType,
 };
 use git::{handle_existing_repo, handle_new_repo};
 use rand::{rngs::StdRng, seq::SliceRandom, SeedableRng};

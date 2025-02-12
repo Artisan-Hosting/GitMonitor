@@ -6,9 +6,9 @@ use artisan_middleware::{
 use dusa_collection_utils::log;
 use dusa_collection_utils::{
     errors::ErrorArrayItem,
-    log::{LogLevel, set_log_level},
-    stringy::Stringy,
-    types::PathType,
+    logger::{LogLevel, set_log_level},
+    types::stringy::Stringy,
+    types::pathtype::PathType,
 };
 
 pub fn get_config() -> AppConfig {

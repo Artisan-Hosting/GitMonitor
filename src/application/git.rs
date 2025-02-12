@@ -3,10 +3,10 @@ use artisan_middleware::{
 };
 use dusa_collection_utils::{
     errors::{ErrorArrayItem, Errors},
-    types::{ClonePath, PathType},
+    types::pathtype::{ClonePath, PathType},
 };
 use dusa_collection_utils::log;
-use dusa_collection_utils::log::LogLevel;
+use dusa_collection_utils::logger::LogLevel;
 
 use crate::pull::pull_updates;
 
