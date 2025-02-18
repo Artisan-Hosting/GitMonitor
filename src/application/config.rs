@@ -30,6 +30,7 @@ pub async fn generate_state(config: &AppConfig) -> AppState {
             // log!(LogLevel::Trace, "Previous state data: {:#?}", loaded_data);
             loaded_data.data = String::from("Initializing");
             loaded_data.config.debug_mode = config.debug_mode;
+            loaded_data.config.git = config.git.clone();
             loaded_data.last_updated = current_timestamp();
             loaded_data.config.log_level = config.log_level;
             loaded_data.config.aggregator = config.aggregator.clone();

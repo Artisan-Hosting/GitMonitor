@@ -1,112 +1,78 @@
-use artisan_middleware::git_actions::{GitAction, GitAuth};
 use dusa_collection_utils::log;
 use dusa_collection_utils::logger::LogLevel;
-use dusa_collection_utils::{
-    errors::{ErrorArray, ErrorArrayItem, Errors},
-    types::pathtype::PathType,
-};
-use std::{process::Output, time::Duration};
-use tokio::time::sleep;
+use dusa_collection_utils::types::pathtype::PathType;
+use dusa_collection_utils::types::stringy::Stringy;
+use git2::{BranchType, Repository};
+use std::process::Command;
 
-use crate::git::{fetch_updates, set_safe_directory};
+/// Pulls the latest changes using `git pull`.
+pub fn pull_latest_changes(repo_path: &str, branch_name: Stringy) -> std::io::Result<()> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .arg("pull")
+        .arg("origin")
+        .arg(branch_name)
+        .arg("--rebase")
+        .output()?;
 
-const MAX_RETRIES: u8 = 3; // Maximum number of retries
-const RETRY_DELAY_SECS: u64 = 3; // Delay between retries in seconds
-
-pub async fn pull_updates(auth: &GitAuth, git_project_path: &PathType) -> Result<bool, ErrorArray> {
-    log!(LogLevel::Trace, "Starting update for {}", auth.generate_id());
-    let error_array = &mut ErrorArray::new_container();
-    let mut retries = 0;
-
-    loop {
-        let pull_update = GitAction::Pull {
-            target_branch: auth.branch.clone(),
-            destination: git_project_path.clone(),
-        };
-
-        log!(LogLevel::Trace, "Pulling: {}", auth.generate_id());
-        match pull_update.execute().await {
-            Ok(output) => {
-                let hpo = handle_pull_output(output);
-                match hpo {
-                    Ok(d) => return Ok(d),
-                    Err(e) => {
-                        error_array.push(e);
-                        return Err(error_array.to_owned());
-                    }
-                }
-            }
-            Err(e) => {
-                error_array.push(e.clone());
-
-                if retries >= MAX_RETRIES {
-                    error_array.push(ErrorArrayItem::new(
-                        dusa_collection_utils::errors::Errors::Git,
-                        format!("Maximum retry attempts reached for: {}", git_project_path),
-                    ));
-                    return Err(error_array.to_owned());
-                }
-
-                if let Some(result) =
-                    handle_pull_error(e, error_array, auth, git_project_path).await
-                {
-                    match result {
-                        Ok(b) => return Ok(b),
-                        Err(ea) => {
-                            return Err(ea);
-                        }
-                    } // Either a success or non-recoverable error was handled
-                }
-
-                retries += 1;
-                log!(
-                    LogLevel::Error,
-                    "Attempt {} failed. Retrying in {} seconds...",
-                    retries,
-                    RETRY_DELAY_SECS
-                );
-                sleep(Duration::from_secs(RETRY_DELAY_SECS)).await; // Delay before retrying
-            }
-        }
-    }
-}
-
-fn handle_pull_output(output: Option<Output>) -> Result<bool, ErrorArrayItem> {
-    if let Some(data) = output {
-        let stdout_str = String::from_utf8_lossy(&data.stdout);
-        if stdout_str.contains("Already up to date.") {
-            log!(LogLevel::Trace, "Already up to date");
-            Ok(false) // No new data was pulled
-        } else {
-            log!(LogLevel::Trace, "Updated");
-            Ok(true) // New data was pulled
-        }
+    if output.status.success() {
+        log!(
+            LogLevel::Info,
+            "Successfully pulled latest changes for: {}.",
+            repo_path
+        );
     } else {
-        log!(LogLevel::Trace, "Git cli returned no output");
-        Ok(false) // No data was available
+        log!(LogLevel::Error, "Failed to pull changes: {:?}", output);
     }
+
+    Ok(())
 }
 
-async fn handle_pull_error(
-    e: ErrorArrayItem,
-    ea: &mut ErrorArray,
-    _auth: &GitAuth,
-    git_project_path: &PathType,
-) -> Option<Result<bool, ErrorArray>> {
-    if e.err_type == Errors::GeneralError {
-        log!(LogLevel::Debug, "Non-critical errors occurred");
-        return Some(Ok(true)); // Assume new data was pulled in case of non-critical error
-    } else if e.to_string().contains("safe directory") {
-        // Handle "safe directory" error by setting the safe directory and retrying the pull
-        if let Err(e) = set_safe_directory(git_project_path).await {
-            ea.push(e);  // Capture any errors that occur while setting the safe directory
-        }
-        if let Err(e) = fetch_updates(git_project_path).await {
-            ea.push(e); // Capture any errors during the fetch
-        }
-        // Recursively call pull_updates inside a Box to avoid infinite future size
-        return None; // Allow the main loop to handle retry after a delay
+/// Clones the repository if it does not exist.
+pub fn clone_repo(repo_url: &str, dest_path: &PathType) -> Result<(), git2::Error> {
+    if !dest_path.exists() {
+        log!(LogLevel::Info, "Cloning repository into {}", dest_path);
+        Repository::clone(repo_url, dest_path)?;
+    }
+    Ok(())
+}
+
+pub fn branch_exists(repo: &Repository, branch_name: Stringy) -> bool {
+    repo.find_branch(&branch_name, BranchType::Local).is_ok()
+}
+
+/// Creates a local tracking branch if it does not exist.
+fn create_tracking_branch(repo: &Repository, branch_name: &str) -> Result<(), git2::Error> {
+    let remote_branch_ref = format!("refs/remotes/origin/{}", branch_name);
+    let remote_branch = repo.refname_to_id(&remote_branch_ref)?;
+
+    let commit = repo.find_commit(remote_branch)?;
+    repo.branch(branch_name, &commit, false)?;
+
+    Ok(())
+}
+
+/// Switches to the specified branch (creates it if necessary).
+pub fn checkout_branch(repo: &Repository, branch_name: Stringy) -> Result<(), git2::Error> {
+    if !branch_exists(repo, branch_name.clone()) {
+        log!(
+            LogLevel::Debug,
+            "Branch '{}' does not exist locally. Creating a tracking branch...",
+            branch_name
+        );
+        create_tracking_branch(repo, &branch_name)?;
     }
 
-    Some(Err(ea.to_owned())) // Propagate any other errors
+    let branch_ref = format!("refs/heads/{}", branch_name);
+    let obj = repo.revparse_single(&branch_ref)?;
+
+    let mut checkout_opts = git2::build::CheckoutBuilder::new();
+    repo.checkout_tree(&obj, Some(&mut checkout_opts))?;
+
+    repo.set_head(&branch_ref)?;
+
+    log!(LogLevel::Debug, "Switched to branch '{}'", branch_name);
+
+    Ok(())
 }

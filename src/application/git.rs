@@ -1,39 +1,53 @@
 use artisan_middleware::{
-    git_actions::{GitAction, GitAuth, GitServer}, users::{get_id, set_file_ownership}
+    git_actions::{GitAction, GitAuth},
+    users::{get_id, set_file_ownership},
 };
+use dusa_collection_utils::{functions::truncate, log};
+use dusa_collection_utils::logger::LogLevel;
 use dusa_collection_utils::{
     errors::{ErrorArrayItem, Errors},
-    types::pathtype::{ClonePath, PathType},
+    types::pathtype::PathType,
 };
-use dusa_collection_utils::log;
-use dusa_collection_utils::logger::LogLevel;
+use git2::Repository;
 
-use crate::pull::pull_updates;
+use crate::pull::{checkout_branch, clone_repo, pull_latest_changes};
 
 // Handle an existing repo: fetch, pull if upstream is ahead, set tracking, restart if needed
 pub async fn handle_existing_repo(
     auth: &GitAuth,
+    repo: Repository,
     git_project_path: &PathType,
 ) -> Result<(), ErrorArrayItem> {
-    log!(LogLevel::Trace, "Working on existing git repo {}", auth.generate_id());
+    log!(
+        LogLevel::Trace,
+        "Working on existing git repo {}",
+        auth.generate_id()
+    );
+
     // set_safe_directory(git_project_path).await?;
-    fetch_updates(git_project_path).await?;
+    fetch_updates(&repo).await?;
 
-    if is_upstream_ahead(auth, git_project_path).await? {
-        let new_data_downloaded = match pull_updates(auth, git_project_path).await {
-            Ok(d) => d,
-            Err(ea) => {
-                ea.display(false);
-                return Err(ErrorArrayItem::new(Errors::Git, format!("Errors occurred while updating, {}", auth.generate_id())))
-            },
-        };
+    // Check if upstream is ahead
+    let remote_ahead: bool = match is_remote_ahead(auth, &repo).await {
+        Ok(b) => Ok(b),
+        Err(err) => Err(ErrorArrayItem::new(Errors::Git, err.message())),
+    }?;
 
-        if new_data_downloaded {
-            // finalize_git_actions(auth, git_project_path).await?;
-            log!(LogLevel::Info, "{} has been updated", auth.generate_id());
-        } else {
-            log!(LogLevel::Trace, "No new data pulled for. {}", auth.generate_id());
-        }
+    if remote_ahead {
+        pull_latest_changes(git_project_path.to_str().unwrap(), auth.branch.clone())
+            .map_err(ErrorArrayItem::from)?;
+
+        checkout_branch(&repo, auth.branch.clone())
+            .map_err(|err| ErrorArrayItem::new(Errors::Git, err.message()))?;
+
+        log!(
+            LogLevel::Info,
+            "{} Updated, runner should rebuild this shortly.",
+            auth.generate_id()
+        );
+
+    } else {
+        log!(LogLevel::Info, "{}: Up to date !", auth.generate_id());
     }
 
     Ok(())
@@ -41,18 +55,12 @@ pub async fn handle_existing_repo(
 
 pub async fn handle_new_repo(
     auth: &GitAuth,
-    server: &GitServer,
     git_project_path: &PathType,
 ) -> Result<(), ErrorArrayItem> {
     // Clone the repository
-    let git_clone = GitAction::Clone {
-        repo_name: auth.clone().repo,
-        repo_owner: auth.clone().user,
-        destination: git_project_path.clone_path(),
-        repo_branch: auth.clone().branch,
-        server: server.clone(),
-    };
-    git_clone.execute().await?;
+    let repo_url = auth.assemble_remote_url();
+    clone_repo(&repo_url, git_project_path)
+        .map_err(|err| ErrorArrayItem::new(Errors::Git, err.message()))?;
 
     // Set ownership to the web user
     let webuser = get_id("www-data")?;
@@ -61,15 +69,22 @@ pub async fn handle_new_repo(
     // Set safe directory
     set_safe_directory(git_project_path).await?;
 
-    // Force switch to the correct branch after cloning
-    fetch_updates(git_project_path).await?;
+    let repo = Repository::open(git_project_path)
+        .map_err(|err| ErrorArrayItem::new(Errors::Git, err.message()))?;
+
+    checkout_branch(&repo, auth.branch.clone())
+        .map_err(|err| ErrorArrayItem::new(Errors::Git, err.message()))?;
 
     Ok(())
 }
 
 // Set the git project as a safe directory
 pub async fn set_safe_directory(git_project_path: &PathType) -> Result<(), ErrorArrayItem> {
-    log!(LogLevel::Trace, "Setting safe dir for {}", git_project_path.to_string());
+    log!(
+        LogLevel::Trace,
+        "Setting safe dir for {}",
+        git_project_path.to_string()
+    );
     let set_safe = GitAction::SetSafe {
         directory: git_project_path.clone(),
     };
@@ -79,41 +94,40 @@ pub async fn set_safe_directory(git_project_path: &PathType) -> Result<(), Error
 }
 
 // Fetch updates from the remote repository
-pub async fn fetch_updates(git_project_path: &PathType) -> Result<(), ErrorArrayItem> {
-    log!(LogLevel::Trace, "Fetching updates for, {}", git_project_path.to_string());
-    let fetch_update = GitAction::Fetch {
-        destination: git_project_path.clone(),
-    };
-    fetch_update.execute().await?;
+pub async fn fetch_updates(repo: &Repository) -> Result<(), ErrorArrayItem> {
+    log!(
+        LogLevel::Debug,
+        "Fetching updates for, {}",
+        PathType::Path(repo.path().into())
+    );
 
-    Ok(())
+    // TODO allow changing the remote from origin
+
+    match repo.find_remote("origin") {
+        Ok(mut remote) => {
+            if let Err(err) = remote.fetch(&["+refs/heads/*:refs/remotes/origin/*"], None, None) {
+                Err(ErrorArrayItem::new(Errors::Git, err.message()))
+            } else {
+                Ok(())
+            }
+        }
+        Err(err) => Err(ErrorArrayItem::new(Errors::Git, err.message())),
+    }
 }
 
 // Check if the upstream branch is ahead of the local branch
-async fn is_upstream_ahead(
+async fn is_remote_ahead(
     auth: &GitAuth,
-    git_project_path: &PathType,
-) -> Result<bool, ErrorArrayItem> {
-    // Assemble the remote URL
-    let remote_url = auth.assemble_remote_url();
+    repo: &Repository,
+) -> Result<bool, git2::Error> {
+    let head = repo.head()?.peel_to_commit()?;
+    let remote_ref = repo.refname_to_id(&format!("refs/remotes/origin/{}", auth.branch))?;
+    let remote_commit = repo.find_commit(remote_ref)?;
+    log!(
+        LogLevel::Debug,
+        "Latest commit on remote: {}",
+        truncate(format!("{}", remote_commit.id()), 8)
+    );
 
-    // The base for comparison should be the remote branch (e.g., "origin/main")
-    let base_branch = format!("{}/{}", remote_url, auth.branch);
-
-    // Create the GitAction::RevList to compare the local and remote branches
-    let rev_list = GitAction::RevList {
-        base: base_branch,         // The remote branch
-        target: auth.branch.to_string(), // The local branch
-        destination: git_project_path.clone_path(),
-    };
-
-    // Execute the RevList action to determine if the remote branch is ahead
-    match rev_list.execute().await {
-        Ok(Some(output)) => {
-            let stdout_str = String::from_utf8_lossy(&output.stdout);
-            let ahead_count: usize = stdout_str.trim().parse().unwrap_or(0);
-            Ok(ahead_count > 0) // If count > 0, upstream is ahead
-        }
-        _ => Ok(false),
-    }
+    Ok(truncate(format!("{}", head.id()), 8) != truncate(format!("{}", remote_commit.id()), 8))
 }

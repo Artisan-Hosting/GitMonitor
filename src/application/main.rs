@@ -4,7 +4,7 @@ use artisan_middleware::{
     aggregator::Status,
     config::AppConfig,
     git_actions::{generate_git_project_id, generate_git_project_path, GitCredentials},
-    state_persistence::{AppState, StatePersistence, log_error, update_state},
+    state_persistence::{log_error, update_state, AppState, StatePersistence},
 };
 use config::{generate_state, get_config};
 use dusa_collection_utils::log;
@@ -13,7 +13,8 @@ use dusa_collection_utils::{
     errors::{ErrorArrayItem, Errors},
     types::pathtype::PathType,
 };
-use git::{handle_existing_repo, handle_new_repo};
+use git::{handle_existing_repo, handle_new_repo, set_safe_directory};
+use git2::Repository;
 use rand::{rngs::StdRng, seq::SliceRandom, SeedableRng};
 use signals::{sighup_watch, sigusr_watch};
 use tokio::{sync::Notify, time::sleep};
@@ -96,10 +97,14 @@ async fn main() {
                 exit_graceful.notify_one();
             }
 
-            _ = tokio::time::sleep(Duration::from_secs(20)) => {
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {
                 state.status = Status::Idle;
                 update_state(&mut state, &state_path, None).await;
                 process_git_repositories(&git_credentials, &mut state, &state_path).await;
+
+                if let Ok(git) = get_git_credentials(&state.config).await {
+                    git_credentials = git;
+                }
             }
         }
     }
@@ -130,11 +135,24 @@ async fn process_git_repositories(
     credentials_shuffled.auth_items.shuffle(&mut rng);
 
     for git_item in credentials_shuffled.auth_items {
-        let git_project_path = generate_git_project_path(&git_item);
-        let result = if git_project_path.exists() {
-            handle_existing_repo(&git_item, &git_project_path).await
-        } else {
-            handle_new_repo(&git_item, &git_item.server, &git_project_path).await
+        
+        let git_project_path: PathType = generate_git_project_path(&git_item);
+        if let Err(err) = set_safe_directory(&git_project_path).await {
+            log!(LogLevel::Error, "{}", err.err_mesg)
+        }
+
+        // Open the repository directory
+        let repo_result = match Repository::open(git_project_path.clone()) {
+            Ok(repo) => Ok(repo),
+            Err(err) => Err(ErrorArrayItem::new(Errors::Git, err.message()))
+        };
+
+        let result = match repo_result {
+            Ok(repo) => handle_existing_repo(&git_item, repo, &git_project_path).await,
+            Err(err) => {
+                log!(LogLevel::Warn, "Failed tp open: {}, Assuming it doesn't exist and clonning. {}", git_project_path, err.err_mesg);
+                handle_new_repo(&git_item, &git_project_path).await
+            },
         };
 
         if let Err(err) = result {
