@@ -2,15 +2,18 @@ use artisan_middleware::{
     git_actions::{GitAction, GitAuth},
     users::{get_id, set_file_ownership},
 };
-use dusa_collection_utils::{functions::truncate, log};
 use dusa_collection_utils::logger::LogLevel;
 use dusa_collection_utils::{
     errors::{ErrorArrayItem, Errors},
     types::pathtype::PathType,
 };
-use git2::Repository;
+use dusa_collection_utils::{functions::truncate, log};
+use git2::{Cred, FetchOptions, RemoteCallbacks, Repository};
 
-use crate::pull::{checkout_branch, clone_repo, pull_latest_changes};
+use crate::{
+    auth::get_gh_token,
+    pull::{checkout_branch, clone_repo, pull_latest_changes},
+};
 
 // Handle an existing repo: fetch, pull if upstream is ahead, set tracking, restart if needed
 pub async fn handle_existing_repo(
@@ -45,7 +48,6 @@ pub async fn handle_existing_repo(
             "{} Updated, runner should rebuild this shortly.",
             auth.generate_id()
         );
-
     } else {
         log!(LogLevel::Info, "{}: Up to date !", auth.generate_id());
     }
@@ -101,11 +103,39 @@ pub async fn fetch_updates(repo: &Repository) -> Result<(), ErrorArrayItem> {
         PathType::Path(repo.path().into())
     );
 
+    let token: String = match get_gh_token() {
+        Ok(token) => token,
+        Err(err) => {
+            let mut error = ErrorArrayItem::from(err);
+            error.err_mesg = format!("Error using gh to get token: {}", error.err_mesg).into();
+            return Err(error)
+        },
+    };
+
+    log!(LogLevel::Debug, "Token: {}", token);
+
+    // Authentication callback
+    let mut auth_cb = RemoteCallbacks::new();
+    auth_cb.credentials(move |_url, username_from_url, _allowed_types| {
+        Cred::userpass_plaintext(
+            username_from_url.unwrap_or("oauth2"), // GitHub accepts "x-access-token" or "oauth2" as user
+            &token,
+        )
+    });
+
+
     // TODO allow changing the remote from origin
 
     match repo.find_remote("origin") {
         Ok(mut remote) => {
-            if let Err(err) = remote.fetch(&["+refs/heads/*:refs/remotes/origin/*"], None, None) {
+            let mut fetch_options = FetchOptions::new();
+            fetch_options.remote_callbacks(auth_cb);
+
+            if let Err(err) = remote.fetch(
+                &["+refs/heads/*:refs/remotes/origin/*"],
+                Some(&mut fetch_options),
+                None,
+            ) {
                 Err(ErrorArrayItem::new(Errors::Git, err.message()))
             } else {
                 Ok(())
@@ -116,10 +146,7 @@ pub async fn fetch_updates(repo: &Repository) -> Result<(), ErrorArrayItem> {
 }
 
 // Check if the upstream branch is ahead of the local branch
-async fn is_remote_ahead(
-    auth: &GitAuth,
-    repo: &Repository,
-) -> Result<bool, git2::Error> {
+async fn is_remote_ahead(auth: &GitAuth, repo: &Repository) -> Result<bool, git2::Error> {
     let head = repo.head()?.peel_to_commit()?;
     let remote_ref = repo.refname_to_id(&format!("refs/remotes/origin/{}", auth.branch))?;
     let remote_commit = repo.find_commit(remote_ref)?;
