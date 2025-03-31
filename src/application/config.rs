@@ -3,11 +3,12 @@ use artisan_middleware::config::AppConfig;
 use artisan_middleware::resource_monitor::ResourceMonitorLock;
 use artisan_middleware::state_persistence::{self, update_state, AppState, StatePersistence};
 use artisan_middleware::timestamp::current_timestamp;
+use artisan_middleware::version::{aml_version, str_to_version};
 use dusa_collection_utils::log;
 use dusa_collection_utils::logger::{set_log_level, LogLevel};
 use dusa_collection_utils::types::pathtype::PathType;
 use dusa_collection_utils::types::stringy::Stringy;
-use dusa_collection_utils::version::SoftwareVersion;
+use dusa_collection_utils::version::{SoftwareVersion, Version, VersionCode};
 
 pub fn get_config() -> AppConfig {
     let mut config: AppConfig = match AppConfig::new() {
@@ -31,6 +32,16 @@ pub async fn generate_state(config: &AppConfig) -> AppState {
             // log!(LogLevel::Trace, "Previous state data: {:#?}", loaded_data);
             loaded_data.data = String::from("Initializing");
             loaded_data.config.debug_mode = config.debug_mode;
+            loaded_data.version = {
+                let library_version: Version = aml_version();
+                let software_version: Version =
+                    str_to_version(env!("CARGO_PKG_VERSION"), Some(VersionCode::Production));
+
+                SoftwareVersion {
+                    application: software_version,
+                    library: library_version,
+                }
+            };
             loaded_data.config.git = config.git.clone();
             loaded_data.last_updated = current_timestamp();
             loaded_data.config.log_level = config.log_level;
