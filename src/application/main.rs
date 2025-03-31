@@ -20,6 +20,7 @@ mod config;
 mod git;
 mod pull;
 mod signals;
+mod auth;
 
 #[tokio::main]
 async fn main() {
@@ -59,7 +60,7 @@ async fn main() {
     // Update state to indicate initialization
     state.config.git = config.git.clone();
     state.data = String::from("Git monitor is initialized");
-    state.status = Status::Idle;
+    state.status = Status::Running;
 
     update_state_wrapper(&mut state, &state_path, &monitor).await;
 
@@ -106,7 +107,7 @@ async fn main() {
             }
 
             _ = tokio::time::sleep(Duration::from_secs(5)) => {
-                state.status = Status::Idle;
+                state.status = Status::Running;
 
                 update_state_wrapper(&mut state, &state_path, &monitor).await;
                 process_git_repositories(&git_credentials, &mut state, &state_path, &monitor).await;
@@ -150,7 +151,6 @@ async fn process_git_repositories(
         if let Err(err) = set_safe_directory(&git_project_path).await {
             log!(LogLevel::Error, "{}", err.err_mesg)
         }
-
         // Open the repository directory
         let repo_result = match Repository::open(git_project_path.clone()) {
             Ok(repo) => Ok(repo),
