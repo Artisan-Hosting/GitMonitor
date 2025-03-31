@@ -108,8 +108,8 @@ pub async fn fetch_updates(repo: &Repository) -> Result<(), ErrorArrayItem> {
         Err(err) => {
             let mut error = ErrorArrayItem::from(err);
             error.err_mesg = format!("Error using gh to get token: {}", error.err_mesg).into();
-            return Err(error)
-        },
+            return Err(error);
+        }
     };
 
     log!(LogLevel::Debug, "Token: {}", token);
@@ -122,7 +122,6 @@ pub async fn fetch_updates(repo: &Repository) -> Result<(), ErrorArrayItem> {
             &token,
         )
     });
-
 
     // TODO allow changing the remote from origin
 

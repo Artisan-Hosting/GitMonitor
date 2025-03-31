@@ -101,22 +101,27 @@ pub async fn update_state_wrapper(
     path: &PathType,
     monitor: &Option<ResourceMonitorLock>,
 ) {
-
     let mut metrics: Option<Metrics> = None;
 
-    if let Some(monitor) = monitor {       
+    if let Some(monitor) = monitor {
         match monitor.get_metrics().await {
             Ok(met) => metrics = Some(met),
             Err(err) => {
-                log!(LogLevel::Error, "Failed to get monitor data: {}", err.err_mesg);
-            },
+                log!(
+                    LogLevel::Error,
+                    "Failed to get monitor data: {}",
+                    err.err_mesg
+                );
+            }
         }
-
     }
- 
+
     let error_array_max_size = 5;
     if state.error_log.len().gt(&error_array_max_size) {
-        state.data = format!("The error log has a legnth of {}. Truncating...", state.error_log.len());
+        state.data = format!(
+            "The error log has a legnth of {}. Truncating...",
+            state.error_log.len()
+        );
         state.error_log.truncate(error_array_max_size);
     }
 

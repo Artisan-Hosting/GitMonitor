@@ -6,9 +6,9 @@ use artisan_middleware::{
 use dusa_collection_utils::log;
 use dusa_collection_utils::{
     errors::ErrorArrayItem,
-    logger::{LogLevel, set_log_level},
-    types::stringy::Stringy,
+    logger::{set_log_level, LogLevel},
     types::pathtype::PathType,
+    types::stringy::Stringy,
 };
 
 pub fn get_config() -> AppConfig {
@@ -31,9 +31,10 @@ async fn get_git_credentials(config: &AppConfig) -> Result<GitCredentials, Error
             GitCredentials::new(Some(&git_file)).await
         }
         None => {
-            let git_file: PathType = PathType::Stringy(Stringy::from("/etc/git_monitor/Credentials.cf"));
+            let git_file: PathType =
+                PathType::Stringy(Stringy::from("/etc/git_monitor/Credentials.cf"));
             GitCredentials::new(Some(&git_file)).await
-        },
+        }
     }
 }
 
@@ -208,7 +209,10 @@ async fn main() {
             }
             "or" => {
                 set_log_level(LogLevel::Debug);
-                log!(LogLevel::Debug, "No \" or \" isn't actually an option dumbass");
+                log!(
+                    LogLevel::Debug,
+                    "No \" or \" isn't actually an option dumbass"
+                );
                 set_log_level(config.log_level);
             }
             _ => {

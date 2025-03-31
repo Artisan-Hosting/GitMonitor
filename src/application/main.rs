@@ -1,7 +1,11 @@
 use std::{sync::Arc, time::Duration};
 
 use artisan_middleware::{
-    aggregator::Status, config::AppConfig, git_actions::{generate_git_project_id, generate_git_project_path, GitCredentials}, resource_monitor::ResourceMonitorLock, state_persistence::{log_error, update_state, AppState, StatePersistence}
+    aggregator::Status,
+    config::AppConfig,
+    git_actions::{generate_git_project_id, generate_git_project_path, GitCredentials},
+    resource_monitor::ResourceMonitorLock,
+    state_persistence::{log_error, update_state, AppState, StatePersistence},
 };
 use config::{generate_state, get_config, update_state_wrapper};
 use dusa_collection_utils::log;
@@ -16,11 +20,11 @@ use rand::{rngs::StdRng, seq::SliceRandom, SeedableRng};
 use signals::{sighup_watch, sigusr_watch};
 use tokio::{sync::Notify, time::sleep};
 
+mod auth;
 mod config;
 mod git;
 mod pull;
 mod signals;
-mod auth;
 
 #[tokio::main]
 async fn main() {
@@ -36,9 +40,13 @@ async fn main() {
     let monitor: Option<ResourceMonitorLock> = match ResourceMonitorLock::new(state.pid as i32) {
         Ok(mon) => Some(mon),
         Err(err) => {
-            log!(LogLevel::Error, "Can't get resource monitor: {}", err.err_mesg);
+            log!(
+                LogLevel::Error,
+                "Can't get resource monitor: {}",
+                err.err_mesg
+            );
             None
-        },
+        }
     };
 
     // loading signal handeling
@@ -146,7 +154,6 @@ async fn process_git_repositories(
     credentials_shuffled.auth_items.shuffle(&mut rng);
 
     for git_item in credentials_shuffled.auth_items {
-        
         let git_project_path: PathType = generate_git_project_path(&git_item);
         if let Err(err) = set_safe_directory(&git_project_path).await {
             log!(LogLevel::Error, "{}", err.err_mesg)
@@ -154,15 +161,20 @@ async fn process_git_repositories(
         // Open the repository directory
         let repo_result = match Repository::open(git_project_path.clone()) {
             Ok(repo) => Ok(repo),
-            Err(err) => Err(ErrorArrayItem::new(Errors::Git, err.message()))
+            Err(err) => Err(ErrorArrayItem::new(Errors::Git, err.message())),
         };
 
         let result = match repo_result {
             Ok(repo) => handle_existing_repo(&git_item, repo, &git_project_path).await,
             Err(err) => {
-                log!(LogLevel::Warn, "Failed tp open: {}, Assuming it doesn't exist and clonning. {}", git_project_path, err.err_mesg);
+                log!(
+                    LogLevel::Warn,
+                    "Failed tp open: {}, Assuming it doesn't exist and clonning. {}",
+                    git_project_path,
+                    err.err_mesg
+                );
                 handle_new_repo(&git_item, &git_project_path).await
-            },
+            }
         };
 
         if let Err(err) = result {
