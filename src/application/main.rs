@@ -1,12 +1,9 @@
 use std::{sync::Arc, time::Duration};
 
 use artisan_middleware::{
-    aggregator::Status,
-    config::AppConfig,
-    git_actions::{generate_git_project_id, generate_git_project_path, GitCredentials},
-    state_persistence::{log_error, update_state, AppState, StatePersistence},
+    aggregator::Status, config::AppConfig, git_actions::{generate_git_project_id, generate_git_project_path, GitCredentials}, resource_monitor::ResourceMonitorLock, state_persistence::{log_error, update_state, AppState, StatePersistence}
 };
-use config::{generate_state, get_config};
+use config::{generate_state, get_config, update_state_wrapper};
 use dusa_collection_utils::log;
 use dusa_collection_utils::logger::{set_log_level, LogLevel};
 use dusa_collection_utils::{
@@ -34,6 +31,15 @@ async fn main() {
     let mut state: AppState = generate_state(&config).await;
     update_state(&mut state, &state_path, None).await;
 
+    // Self monitring
+    let monitor: Option<ResourceMonitorLock> = match ResourceMonitorLock::new(state.pid as i32) {
+        Ok(mon) => Some(mon),
+        Err(err) => {
+            log!(LogLevel::Error, "Can't get resource monitor: {}", err.err_mesg);
+            None
+        },
+    };
+
     // loading signal handeling
     let reload: Arc<Notify> = Arc::new(Notify::new());
     let exit_graceful: Arc<Notify> = Arc::new(Notify::new());
@@ -54,7 +60,8 @@ async fn main() {
     state.config.git = config.git.clone();
     state.data = String::from("Git monitor is initialized");
     state.status = Status::Idle;
-    update_state(&mut state, &state_path, None).await;
+
+    update_state_wrapper(&mut state, &state_path, &monitor).await;
 
     if config.debug_mode {
         set_log_level(LogLevel::Debug);
@@ -86,9 +93,10 @@ async fn main() {
             _ = exit_graceful.notified() => {
                 state.data = String::from("Git monitor exiting");
                 state.status = Status::Stopped;
-                update_state(&mut state, &state_path, None).await;
+                // update_state(&mut state, &state_path, None).await;
+                update_state_wrapper(&mut state, &state_path, &monitor).await;
                 log!(LogLevel::Info, "Shutting down gracefully");
-                process_git_repositories(&git_credentials, &mut state, &state_path).await;
+                process_git_repositories(&git_credentials, &mut state, &state_path, &monitor).await;
                 std::process::exit(0)
             }
 
@@ -99,8 +107,9 @@ async fn main() {
 
             _ = tokio::time::sleep(Duration::from_secs(5)) => {
                 state.status = Status::Idle;
-                update_state(&mut state, &state_path, None).await;
-                process_git_repositories(&git_credentials, &mut state, &state_path).await;
+
+                update_state_wrapper(&mut state, &state_path, &monitor).await;
+                process_git_repositories(&git_credentials, &mut state, &state_path, &monitor).await;
 
                 if let Ok(git) = get_git_credentials(&state.config).await {
                     git_credentials = git;
@@ -129,6 +138,7 @@ async fn process_git_repositories(
     git_credentials: &GitCredentials,
     state: &mut AppState,
     state_path: &PathType,
+    monitor: &Option<ResourceMonitorLock>,
 ) {
     let mut credentials_shuffled = git_credentials.clone();
     let mut rng: StdRng = StdRng::from_entropy();
@@ -160,7 +170,9 @@ async fn process_git_repositories(
         } else {
             state.event_counter += 1;
             state.data = format!("Updated: {}", generate_git_project_id(&git_item));
-            update_state(state, state_path, None).await;
+            update_state_wrapper(state, &state_path, &monitor).await;
         }
+
+        sleep(Duration::from_secs(1)).await;
     }
 }
