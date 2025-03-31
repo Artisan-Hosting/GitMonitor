@@ -1,9 +1,12 @@
-use dusa_collection_utils::log;
 use dusa_collection_utils::logger::LogLevel;
 use dusa_collection_utils::types::pathtype::PathType;
 use dusa_collection_utils::types::stringy::Stringy;
-use git2::{BranchType, Repository};
+use dusa_collection_utils::{errors::ErrorArrayItem, log};
+use git2::build::RepoBuilder;
+use git2::{BranchType, Cred, FetchOptions, RemoteCallbacks, Repository};
 use std::process::Command;
+
+use crate::auth::get_gh_token;
 
 /// Pulls the latest changes using `git pull`.
 pub fn pull_latest_changes(repo_path: &str, branch_name: Stringy) -> std::io::Result<()> {
@@ -33,7 +36,32 @@ pub fn pull_latest_changes(repo_path: &str, branch_name: Stringy) -> std::io::Re
 pub fn clone_repo(repo_url: &str, dest_path: &PathType) -> Result<(), git2::Error> {
     if !dest_path.exists() {
         log!(LogLevel::Info, "Cloning repository into {}", dest_path);
-        Repository::clone(repo_url, dest_path)?;
+
+        let token: String = match get_gh_token() {
+            Ok(token) => token,
+            Err(err) => {
+                let error = ErrorArrayItem::from(err);
+                log!(
+                    LogLevel::Error,
+                    "Error using gh to get token: {}",
+                    error.err_mesg
+                );
+                return Ok(());
+            }
+        };
+
+        log!(LogLevel::Debug, "Token: {}", token);
+        let mut callbacks = RemoteCallbacks::new();
+        callbacks.credentials(move |_url, username_from_url, _allowed_types| {
+            Cred::userpass_plaintext(username_from_url.unwrap_or("oauth2"), &token)
+        });
+
+        let mut fetch_options = FetchOptions::new();
+        fetch_options.remote_callbacks(callbacks);
+
+        let mut builder = RepoBuilder::new();
+        builder.fetch_options(fetch_options);
+        builder.clone(repo_url, &dest_path)?;
     }
     Ok(())
 }
