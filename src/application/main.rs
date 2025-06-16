@@ -18,6 +18,8 @@ use git::{handle_existing_repo, handle_new_repo, set_safe_directory};
 use git2::Repository;
 use rand::{rngs::StdRng, seq::SliceRandom, SeedableRng};
 use signals::{sighup_watch, sigusr_watch};
+
+use auth::init_gh_token;
 use tokio::{sync::Notify, time::sleep};
 
 mod auth;
@@ -29,6 +31,10 @@ mod signals;
 #[tokio::main]
 async fn main() {
     // Initialization
+
+    if let Err(err) = init_gh_token() {
+        log!(LogLevel::Error, "Failed to load GitHub token: {}", err);
+    }
 
     // Loading configs
     let mut config: AppConfig = get_config();
