@@ -25,11 +25,15 @@ pub fn pull_latest_changes(repo_path: &str, branch_name: Stringy) -> std::io::Re
             "Successfully pulled latest changes for: {}.",
             repo_path
         );
+        Ok(())
     } else {
         log!(LogLevel::Error, "Failed to pull changes: {:?}", output);
+        let msg = format!(
+            "git pull failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Err(std::io::Error::new(std::io::ErrorKind::Other, msg))
     }
-
-    Ok(())
 }
 
 /// Clones the repository if it does not exist.
