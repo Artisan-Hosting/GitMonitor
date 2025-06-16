@@ -37,11 +37,11 @@ pub async fn handle_existing_repo(
     }?;
 
     if remote_ahead {
-        pull_latest_changes(git_project_path.to_str().unwrap(), auth.branch.clone())
-            .map_err(ErrorArrayItem::from)?;
-
         checkout_branch(&repo, auth.branch.clone())
             .map_err(|err| ErrorArrayItem::new(Errors::Git, err.message()))?;
+
+        pull_latest_changes(git_project_path.to_str().unwrap(), auth.branch.clone())
+            .map_err(ErrorArrayItem::from)?;
 
         log!(
             LogLevel::Info,
