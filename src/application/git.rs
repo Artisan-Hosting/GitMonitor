@@ -149,11 +149,17 @@ async fn is_remote_ahead(auth: &GitAuth, repo: &Repository) -> Result<bool, git2
     let head = repo.head()?.peel_to_commit()?;
     let remote_ref = repo.refname_to_id(&format!("refs/remotes/origin/{}", auth.branch))?;
     let remote_commit = repo.find_commit(remote_ref)?;
+
     log!(
         LogLevel::Debug,
         "Latest commit on remote: {}",
         truncate(format!("{}", remote_commit.id()), 8)
     );
+    log!(
+        LogLevel::Debug,
+        "Latest local commit: {}",
+        truncate(format!("{}", head.id()), 8)
+    );
 
-    Ok(truncate(format!("{}", head.id()), 8) != truncate(format!("{}", remote_commit.id()), 8))
+    Ok(head.id() != remote_commit.id())
 }
