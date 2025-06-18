@@ -1,4 +1,17 @@
+use once_cell::sync::OnceCell;
 use std::process::Command;
+
+static GH_TOKEN: OnceCell<String> = OnceCell::new();
+
+pub fn init_gh_token() -> std::io::Result<()> {
+    let token = get_gh_token()?;
+    let _ = GH_TOKEN.set(token);
+    Ok(())
+}
+
+pub fn github_token() -> Option<&'static str> {
+    GH_TOKEN.get().map(|s| s.as_str())
+}
 
 pub fn get_gh_token() -> std::io::Result<String> {
     let output = Command::new("gh").arg("auth").arg("token").output()?;
