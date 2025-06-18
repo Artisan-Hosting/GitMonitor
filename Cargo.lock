@@ -105,6 +105,7 @@ dependencies = [
  "config 0.14.1",
  "dusa_collection_utils 3.2.1",
  "git2",
+ "once_cell",
  "rand 0.8.5",
  "rng",
  "serde",

@@ -11,7 +11,7 @@ use dusa_collection_utils::{functions::truncate, log};
 use git2::{Cred, FetchOptions, RemoteCallbacks, Repository};
 
 use crate::{
-    auth::get_gh_token,
+    auth::github_token,
     pull::{checkout_branch, clone_repo, pull_latest_changes},
 };
 
@@ -103,16 +103,15 @@ pub async fn fetch_updates(repo: &Repository) -> Result<(), ErrorArrayItem> {
         PathType::Path(repo.path().into())
     );
 
-    let token: String = match get_gh_token() {
-        Ok(token) => token,
-        Err(err) => {
-            let mut error = ErrorArrayItem::from(err);
-            error.err_mesg = format!("Error using gh to get token: {}", error.err_mesg).into();
-            return Err(error);
+    let token: &'static str = match github_token() {
+        Some(t) => t,
+        None => {
+            return Err(ErrorArrayItem::new(
+                Errors::Git,
+                "GitHub token not initialized".to_string(),
+            ));
         }
     };
-
-    log!(LogLevel::Debug, "Token: {}", token);
 
     // Authentication callback
     let mut auth_cb = RemoteCallbacks::new();

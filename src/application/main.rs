@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 use artisan_middleware::{
     aggregator::Status,
     config::AppConfig,
-    git_actions::{generate_git_project_id, generate_git_project_path, GitCredentials},
+    git_actions::{generate_git_project_id, generate_git_project_path, GitAuth, GitCredentials},
     resource_monitor::ResourceMonitorLock,
     state_persistence::{log_error, update_state, AppState, StatePersistence},
 };
@@ -16,28 +16,48 @@ use dusa_collection_utils::{
 };
 use git::{handle_existing_repo, handle_new_repo, set_safe_directory};
 use git2::Repository;
-use rand::{rngs::StdRng, seq::SliceRandom, SeedableRng};
+use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
 use signals::{sighup_watch, sigusr_watch};
-use tokio::{sync::Notify, time::sleep};
+use dusa_collection_utils::types::rwarc::LockWithTimeout;
+
+use auth::init_gh_token;
+use git_auth_store::{auth_items, init_auth_box};
+use tokio::{sync::{Mutex, Notify}, time::sleep};
 
 mod auth;
 mod config;
 mod git;
 mod pull;
 mod signals;
+mod git_auth_store;
 
 #[tokio::main]
 async fn main() {
+    tokio::task::LocalSet::new().run_until(async_main()).await;
+}
+
+async fn async_main() {
     // Initialization
+
+    if let Err(err) = init_gh_token() {
+        log!(LogLevel::Error, "Failed to load GitHub token: {}", err);
+    }
 
     // Loading configs
     let mut config: AppConfig = get_config();
     let state_path: PathType = StatePersistence::get_state_path(&config);
-    let mut state: AppState = generate_state(&config).await;
-    update_state(&mut state, &state_path, None).await;
+    let state: Arc<Mutex<AppState>> = Arc::new(Mutex::new(generate_state(&config).await));
+    {
+        let mut s = state.lock().await;
+        update_state(&mut s, &state_path, None).await;
+    }
 
     // Self monitring
-    let monitor: Option<ResourceMonitorLock> = match ResourceMonitorLock::new(state.pid as i32) {
+    let pid = {
+        let s = state.lock().await;
+        s.pid
+    };
+    let monitor: Option<ResourceMonitorLock> = match ResourceMonitorLock::new(pid as i32) {
         Ok(mon) => Some(mon),
         Err(err) => {
             log!(
@@ -57,20 +77,28 @@ async fn main() {
     sigusr_watch(exit_graceful.clone());
 
     // Load Git credentials
-    let mut git_credentials: GitCredentials = match get_git_credentials(&state.config).await {
-        Ok(credentials) => credentials,
-        Err(e) => {
-            log_error(&mut state, e, &state_path).await;
-            std::process::exit(100)
+    let git_credentials: GitCredentials = {
+        let s = state.lock().await;
+        match get_git_credentials(&s.config).await {
+            Ok(credentials) => credentials,
+            Err(e) => {
+                drop(s);
+                let mut s = state.lock().await;
+                log_error(&mut s, e, &state_path).await;
+                std::process::exit(100)
+            }
         }
     };
+    init_auth_box(git_credentials.auth_items.clone());
 
     // Update state to indicate initialization
-    state.config.git = config.git.clone();
-    state.data = String::from("Git monitor is initialized");
-    state.status = Status::Running;
-
-    update_state_wrapper(&mut state, &state_path, &monitor).await;
+    {
+        let mut s = state.lock().await;
+        s.config.git = config.git.clone();
+        s.data = String::from("Git monitor is initialized");
+        s.status = Status::Running;
+        update_state_wrapper(&mut s, &state_path, &monitor).await;
+    }
 
     if config.debug_mode {
         set_log_level(LogLevel::Debug);
@@ -80,10 +108,18 @@ async fn main() {
             "Git credentials loaded {}",
             git_credentials
         );
-        set_log_level(state.config.log_level);
+        let log_level = {
+            let s = state.lock().await;
+            s.config.log_level
+        };
+        set_log_level(log_level);
     };
 
     log!(LogLevel::Info, "Git monitor initialized");
+
+    // Spawn background workers for each repository
+    let monitor_clone = monitor.as_ref().map(|m| m.clone());
+    spawn_git_workers(state.clone(), state_path.clone(), monitor_clone).await;
 
     // Main loop
     loop {
@@ -92,20 +128,23 @@ async fn main() {
             _ = reload.notified() => {
                 sleep(Duration::from_secs(1)).await;
                 config = get_config();
-                state = generate_state(&config).await;
-
-                if let Ok(git) = get_git_credentials(&state.config).await {
-                    git_credentials = git;
+                let new_state = generate_state(&config).await;
+                {
+                    let mut s = state.lock().await;
+                    *s = new_state;
                 }
+
+                let _ = { state.lock().await.config.clone() }; // reload uses current config; repo tasks unchanged
             }
 
             _ = exit_graceful.notified() => {
-                state.data = String::from("Git monitor exiting");
-                state.status = Status::Stopped;
-                // update_state(&mut state, &state_path, None).await;
-                update_state_wrapper(&mut state, &state_path, &monitor).await;
+                {
+                    let mut s = state.lock().await;
+                    s.data = String::from("Git monitor exiting");
+                    s.status = Status::Stopped;
+                    update_state_wrapper(&mut s, &state_path, &monitor).await;
+                }
                 log!(LogLevel::Info, "Shutting down gracefully");
-                process_git_repositories(&git_credentials, &mut state, &state_path, &monitor).await;
                 std::process::exit(0)
             }
 
@@ -115,14 +154,9 @@ async fn main() {
             }
 
             _ = tokio::time::sleep(Duration::from_secs(5)) => {
-                state.status = Status::Running;
-
-                update_state_wrapper(&mut state, &state_path, &monitor).await;
-                process_git_repositories(&git_credentials, &mut state, &state_path, &monitor).await;
-
-                if let Ok(git) = get_git_credentials(&state.config).await {
-                    git_credentials = git;
-                }
+                let mut s = state.lock().await;
+                s.status = Status::Running;
+                update_state_wrapper(&mut s, &state_path, &monitor).await;
             }
         }
     }
@@ -169,7 +203,7 @@ async fn process_git_repositories(
             Err(err) => {
                 log!(
                     LogLevel::Warn,
-                    "Failed tp open: {}, Assuming it doesn't exist and clonning. {}",
+                    "Failed to open: {}, assuming it doesn't exist and cloning. {}",
                     git_project_path,
                     err.err_mesg
                 );
@@ -186,5 +220,91 @@ async fn process_git_repositories(
         }
 
         sleep(Duration::from_secs(1)).await;
+    }
+}
+
+// Worker that continuously processes a single repository with a random delay
+async fn repo_worker(
+    git_item: LockWithTimeout<GitAuth>,
+    state: Arc<Mutex<AppState>>,
+    state_path: PathType,
+    monitor: Option<ResourceMonitorLock>,
+    initial_delay: u64,
+) {
+    sleep(Duration::from_secs(initial_delay)).await;
+    let mut rng: StdRng = StdRng::from_entropy();
+    loop {
+        let git_item_read = match git_item.try_read().await {
+            Ok(ga) => ga.clone(),
+            Err(e) => {
+                log!(LogLevel::Error, "{}", e.err_mesg);
+                sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+        };
+
+        let git_project_path: PathType = generate_git_project_path(&git_item_read);
+        if let Err(err) = set_safe_directory(&git_project_path).await {
+            log!(LogLevel::Error, "{}", err.err_mesg)
+        }
+
+        let repo_result = match Repository::open(git_project_path.clone()) {
+            Ok(repo) => Ok(repo),
+            Err(err) => Err(ErrorArrayItem::new(Errors::Git, err.message())),
+        };
+
+        let result = match repo_result {
+            Ok(repo) => handle_existing_repo(&git_item_read, repo, &git_project_path).await,
+            Err(err) => {
+                log!(
+                    LogLevel::Warn,
+                    "Failed to open: {}, assuming it doesn't exist and cloning. {}",
+                    git_project_path,
+                    err.err_mesg
+                );
+                handle_new_repo(&git_item_read, &git_project_path).await
+            }
+        };
+
+        let mut s = state.lock().await;
+        if let Err(err) = result {
+            log_error(&mut s, err, &state_path).await;
+        } else {
+            s.event_counter += 1;
+            s.data = format!("Updated: {}", generate_git_project_id(&git_item_read));
+            update_state_wrapper(&mut s, &state_path, &monitor).await;
+        }
+        drop(s);
+
+        let wait = rng.gen_range(25..35);
+        sleep(Duration::from_secs(wait)).await;
+    }
+}
+
+// Spawn workers for each repository with slight timer offsets
+async fn spawn_git_workers(
+    state: Arc<Mutex<AppState>>,
+    state_path: PathType,
+    monitor: Option<ResourceMonitorLock>,
+) {
+    let Some(items) = auth_items() else { return };
+    let mut rng: StdRng = StdRng::from_entropy();
+    let mut indices: Vec<usize> = (0..items.len()).collect();
+    indices.shuffle(&mut rng);
+
+    for idx in indices {
+        let git_item = items[idx].clone();
+        let delay = rng.gen_range(0..5);
+        let st = state.clone();
+        let path = state_path.clone();
+        let mon = monitor.as_ref().map(|m| m.clone());
+        tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let local = tokio::task::LocalSet::new();
+            rt.block_on(local.run_until(repo_worker(git_item, st, path, mon, delay)));
+        });
     }
 }
