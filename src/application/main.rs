@@ -174,7 +174,8 @@ async fn get_git_credentials(config: &AppConfig) -> Result<GitCredentials, Error
 }
 
 // Process Git repositories, handling existing and new repos
-async fn process_git_repositories(
+// ! UNUSED RIGHT NOW
+async fn _process_git_repositories(
     git_credentials: &GitCredentials,
     state: &mut AppState,
     state_path: &PathType,
@@ -213,7 +214,7 @@ async fn process_git_repositories(
         } else {
             state.event_counter += 1;
             state.data = format!("Updated: {}", generate_git_project_id(&git_item));
-            update_state_wrapper(state, &state_path, &monitor).await;
+            update_state_wrapper(state, state_path, monitor).await;
         }
 
         sleep(Duration::from_secs(1)).await;
@@ -281,10 +282,12 @@ async fn spawn_git_workers(
     credentials_shuffled.auth_items.shuffle(&mut rng);
 
     for git_item in credentials_shuffled.auth_items {
+		log!(LogLevel::Debug, "Deploying working thread for: {}", generate_git_project_id(&git_item));
         let delay = rng.gen_range(0..5);
         let st = state.clone();
         let path = state_path.clone();
         let mon = monitor.as_ref().map(|m| m.clone());
         tokio::task::spawn_local(async move { repo_worker(git_item, st, path, mon, delay).await });
+        sleep(Duration::from_secs(3)).await;
     }
 }
