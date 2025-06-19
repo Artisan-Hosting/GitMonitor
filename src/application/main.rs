@@ -15,7 +15,6 @@ use dusa_collection_utils::{
     types::pathtype::PathType,
 };
 use git::{handle_existing_repo, handle_new_repo, set_safe_directory};
-use git2::Repository;
 use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
 use signals::{sighup_watch, sigusr_watch};
 use dusa_collection_utils::types::rwarc::LockWithTimeout;
@@ -192,23 +191,15 @@ async fn process_git_repositories(
         if let Err(err) = set_safe_directory(&git_project_path).await {
             log!(LogLevel::Error, "{}", err.err_mesg)
         }
-        // Open the repository directory
-        let repo_result = match Repository::open(git_project_path.clone()) {
-            Ok(repo) => Ok(repo),
-            Err(err) => Err(ErrorArrayItem::new(Errors::Git, err.message())),
-        };
-
-        let result = match repo_result {
-            Ok(repo) => handle_existing_repo(&git_item, repo, &git_project_path).await,
-            Err(err) => {
-                log!(
-                    LogLevel::Warn,
-                    "Failed to open: {}, assuming it doesn't exist and cloning. {}",
-                    git_project_path,
-                    err.err_mesg
-                );
-                handle_new_repo(&git_item, &git_project_path).await
-            }
+        let result = if git_project_path.exists() {
+            handle_existing_repo(&git_item, &git_project_path).await
+        } else {
+            log!(
+                LogLevel::Warn,
+                "Failed to open: {}, assuming it doesn't exist and cloning.",
+                git_project_path
+            );
+            handle_new_repo(&git_item, &git_project_path).await
         };
 
         if let Err(err) = result {
@@ -248,22 +239,15 @@ async fn repo_worker(
             log!(LogLevel::Error, "{}", err.err_mesg)
         }
 
-        let repo_result = match Repository::open(git_project_path.clone()) {
-            Ok(repo) => Ok(repo),
-            Err(err) => Err(ErrorArrayItem::new(Errors::Git, err.message())),
-        };
-
-        let result = match repo_result {
-            Ok(repo) => handle_existing_repo(&git_item_read, repo, &git_project_path).await,
-            Err(err) => {
-                log!(
-                    LogLevel::Warn,
-                    "Failed to open: {}, assuming it doesn't exist and cloning. {}",
-                    git_project_path,
-                    err.err_mesg
-                );
-                handle_new_repo(&git_item_read, &git_project_path).await
-            }
+        let result = if git_project_path.exists() {
+            handle_existing_repo(&git_item_read, &git_project_path).await
+        } else {
+            log!(
+                LogLevel::Warn,
+                "Failed to open: {}, assuming it doesn't exist and cloning.",
+                git_project_path
+            );
+            handle_new_repo(&git_item_read, &git_project_path).await
         };
 
         let mut s = state.lock().await;
