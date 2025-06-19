@@ -1,5 +1,5 @@
 use artisan_middleware::{
-    git_actions::{GitAction, GitAuth},
+    git_actions::GitAuth,
     users::{get_id, set_file_ownership},
 };
 use dusa_collection_utils::logger::LogLevel;
@@ -9,6 +9,8 @@ use dusa_collection_utils::{
 };
 use dusa_collection_utils::{functions::truncate, log};
 use tokio::process::Command;
+use once_cell::sync::Lazy;
+use tokio::sync::Mutex;
 
 use crate::{
     auth::github_token,
@@ -78,6 +80,8 @@ pub async fn handle_new_repo(
     Ok(())
 }
 
+static SAFE_DIR_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
 // Set the git project as a safe directory
 pub async fn set_safe_directory(git_project_path: &PathType) -> Result<(), ErrorArrayItem> {
     log!(
@@ -85,12 +89,45 @@ pub async fn set_safe_directory(git_project_path: &PathType) -> Result<(), Error
         "Setting safe dir for {}",
         git_project_path.to_string()
     );
-    let set_safe = GitAction::SetSafe {
-        directory: git_project_path.clone(),
-    };
-    set_safe.execute().await?;
 
-    Ok(())
+    let path = git_project_path.to_string();
+    let _guard = SAFE_DIR_LOCK.lock().await;
+
+    // Check if already marked safe
+    let check = Command::new("git")
+        .arg("config")
+        .arg("--global")
+        .arg("--get-all")
+        .arg("safe.directory")
+        .output()
+        .await
+        .map_err(|e| ErrorArrayItem::new(Errors::Git, e.to_string()))?;
+
+    if check.status.success() {
+        let existing = String::from_utf8_lossy(&check.stdout);
+        if existing.lines().any(|l| l.trim() == path) {
+            return Ok(());
+        }
+    }
+
+    let status = Command::new("git")
+        .arg("config")
+        .arg("--global")
+        .arg("--add")
+        .arg("safe.directory")
+        .arg(&path)
+        .status()
+        .await
+        .map_err(|e| ErrorArrayItem::new(Errors::Git, e.to_string()))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(ErrorArrayItem::new(
+            Errors::Git,
+            format!("Failed to set safe directory for {}", path),
+        ))
+    }
 }
 
 // Fetch updates from the remote repository
