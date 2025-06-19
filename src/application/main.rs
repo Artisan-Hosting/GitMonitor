@@ -15,11 +15,12 @@ use dusa_collection_utils::{
     types::pathtype::PathType,
 };
 use git::{handle_existing_repo, handle_new_repo, set_safe_directory};
-use git2::Repository;
 use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
 use signals::{sighup_watch, sigusr_watch};
+use dusa_collection_utils::types::rwarc::LockWithTimeout;
 
 use auth::init_gh_token;
+use git_auth_store::{auth_items, init_auth_box};
 use tokio::{sync::{Mutex, Notify}, time::sleep};
 
 
@@ -28,6 +29,7 @@ mod config;
 mod git;
 mod pull;
 mod signals;
+mod git_auth_store;
 
 #[tokio::main]
 async fn main() {
@@ -87,6 +89,7 @@ async fn async_main() {
             }
         }
     };
+    init_auth_box(git_credentials.auth_items.clone());
 
     // Update state to indicate initialization
     {
@@ -116,7 +119,7 @@ async fn async_main() {
 
     // Spawn background workers for each repository
     let monitor_clone = monitor.as_ref().map(|m| m.clone());
-    spawn_git_workers(&git_credentials, state.clone(), state_path.clone(), monitor_clone).await;
+    spawn_git_workers(state.clone(), state_path.clone(), monitor_clone).await;
 
     // Main loop
     loop {
@@ -173,51 +176,82 @@ async fn get_git_credentials(config: &AppConfig) -> Result<GitCredentials, Error
     }
 }
 
-// Process Git repositories, handling existing and new repos
-// ! UNUSED RIGHT NOW
-async fn _process_git_repositories(
-    git_credentials: &GitCredentials,
-    state: &mut AppState,
-    state_path: &PathType,
-    monitor: &Option<ResourceMonitorLock>,
+// Worker that continuously processes a single repository with a random delay
+async fn repo_worker(
+    git_item: LockWithTimeout<GitAuth>,
+    state: Arc<Mutex<AppState>>,
+    state_path: PathType,
+    monitor: Option<ResourceMonitorLock>,
+    initial_delay: u64,
 ) {
-    let mut credentials_shuffled = git_credentials.clone();
+    sleep(Duration::from_secs(initial_delay)).await;
     let mut rng: StdRng = StdRng::from_entropy();
-    credentials_shuffled.auth_items.shuffle(&mut rng);
-
-    for git_item in credentials_shuffled.auth_items {
-        let git_project_path: PathType = generate_git_project_path(&git_item);
-        if let Err(err) = set_safe_directory(&git_project_path).await {
-            log!(LogLevel::Error, "{}", err.err_mesg)
-        }
-        // Open the repository directory
-        let repo_result = match Repository::open(git_project_path.clone()) {
-            Ok(repo) => Ok(repo),
-            Err(err) => Err(ErrorArrayItem::new(Errors::Git, err.message())),
-        };
-
-        let result = match repo_result {
-            Ok(repo) => handle_existing_repo(&git_item, repo, &git_project_path).await,
-            Err(err) => {
-                log!(
-                    LogLevel::Warn,
-                    "Failed tp open: {}, Assuming it doesn't exist and clonning. {}",
-                    git_project_path,
-                    err.err_mesg
-                );
-                handle_new_repo(&git_item, &git_project_path).await
+    loop {
+        let git_item_read = match git_item.try_read().await {
+            Ok(ga) => ga.clone(),
+            Err(e) => {
+                log!(LogLevel::Error, "{}", e.err_mesg);
+                sleep(Duration::from_secs(5)).await;
+                continue;
             }
         };
 
-        if let Err(err) = result {
-            log_error(state, err, state_path).await;
-        } else {
-            state.event_counter += 1;
-            state.data = format!("Updated: {}", generate_git_project_id(&git_item));
-            update_state_wrapper(state, state_path, monitor).await;
+        let git_project_path: PathType = generate_git_project_path(&git_item_read);
+        if let Err(err) = set_safe_directory(&git_project_path).await {
+            log!(LogLevel::Error, "{}", err.err_mesg)
         }
 
-        sleep(Duration::from_secs(1)).await;
+        let result = if git_project_path.exists() {
+            handle_existing_repo(&git_item_read, &git_project_path).await
+        } else {
+            log!(
+                LogLevel::Warn,
+                "Failed to open: {}, assuming it doesn't exist and cloning.",
+                git_project_path
+            );
+            handle_new_repo(&git_item_read, &git_project_path).await
+        };
+
+        let mut s = state.lock().await;
+        if let Err(err) = result {
+            log_error(&mut s, err, &state_path).await;
+        } else {
+            s.event_counter += 1;
+            s.data = format!("Updated: {}", generate_git_project_id(&git_item_read));
+            update_state_wrapper(&mut s, &state_path, &monitor).await;
+        }
+        drop(s);
+
+        let wait = rng.gen_range(25..35);
+        sleep(Duration::from_secs(wait)).await;
+    }
+}
+
+// Spawn workers for each repository with slight timer offsets
+async fn spawn_git_workers(
+    state: Arc<Mutex<AppState>>,
+    state_path: PathType,
+    monitor: Option<ResourceMonitorLock>,
+) {
+    let Some(items) = auth_items() else { return };
+    let mut rng: StdRng = StdRng::from_entropy();
+    let mut indices: Vec<usize> = (0..items.len()).collect();
+    indices.shuffle(&mut rng);
+
+    for idx in indices {
+        let git_item = items[idx].clone();
+        let delay = rng.gen_range(0..5);
+        let st = state.clone();
+        let path = state_path.clone();
+        let mon = monitor.as_ref().map(|m| m.clone());
+        tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let local = tokio::task::LocalSet::new();
+            rt.block_on(local.run_until(repo_worker(git_item, st, path, mon, delay)));
+        });
     }
 }
 
