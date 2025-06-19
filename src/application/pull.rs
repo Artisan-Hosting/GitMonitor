@@ -1,16 +1,28 @@
+use dusa_collection_utils::log;
 use dusa_collection_utils::logger::LogLevel;
 use dusa_collection_utils::types::pathtype::PathType;
 use dusa_collection_utils::types::stringy::Stringy;
-use dusa_collection_utils::log;
 use tokio::process::Command;
 
 use crate::auth::github_token;
 
 /// Pulls the latest changes using `git pull`.
 pub async fn pull_latest_changes(repo_path: &str, branch_name: Stringy) -> std::io::Result<()> {
+    let token: &'static str = match github_token() {
+        Some(t) => t,
+        None => {
+            let err =
+                std::io::Error::new(std::io::ErrorKind::Other, "GitHub token not initialized");
+            return Err(err);
+        }
+    };
+
+    let header = format!("Authorization: Bearer {}", token);
     let output = Command::new("git")
         .arg("-C")
         .arg(repo_path)
+        .arg("-c")
+        .arg(format!("http.extraheader={}", header))
         .arg("pull")
         .arg("origin")
         .arg(branch_name)
@@ -62,7 +74,10 @@ pub async fn clone_repo(repo_url: &str, dest_path: &PathType) -> std::io::Result
     if output.status.success() {
         Ok(())
     } else {
-        let msg = format!("git clone failed: {}", String::from_utf8_lossy(&output.stderr));
+        let msg = format!(
+            "git clone failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         Err(std::io::Error::new(std::io::ErrorKind::Other, msg))
     }
 }
@@ -84,7 +99,10 @@ pub async fn checkout_branch(repo_path: &str, branch_name: Stringy) -> std::io::
         log!(LogLevel::Debug, "Switched to branch '{}'", branch);
         Ok(())
     } else {
-        let msg = format!("git checkout failed: {}", String::from_utf8_lossy(&output.stderr));
+        let msg = format!(
+            "git checkout failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         Err(std::io::Error::new(std::io::ErrorKind::Other, msg))
     }
 }

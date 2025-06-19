@@ -8,8 +8,8 @@ use dusa_collection_utils::{
     types::pathtype::PathType,
 };
 use dusa_collection_utils::{functions::truncate, log};
-use tokio::process::Command;
 use once_cell::sync::Lazy;
+use tokio::process::Command;
 use tokio::sync::Mutex;
 
 use crate::{
@@ -148,7 +148,7 @@ pub async fn fetch_updates(git_project_path: &PathType) -> Result<(), ErrorArray
         }
     };
 
-    let header = format!("AUTHORIZATION: Bearer {}", token);
+    let header = format!("Authorization: Bearer {}", token);
     let output = Command::new("git")
         .arg("-C")
         .arg(git_project_path.to_string())
@@ -170,7 +170,10 @@ pub async fn fetch_updates(git_project_path: &PathType) -> Result<(), ErrorArray
 }
 
 // Check if the upstream branch is ahead of the local branch
-async fn is_remote_ahead(auth: &GitAuth, git_project_path: &PathType) -> Result<bool, std::io::Error> {
+async fn is_remote_ahead(
+    auth: &GitAuth,
+    git_project_path: &PathType,
+) -> Result<bool, std::io::Error> {
     let local = Command::new("git")
         .arg("-C")
         .arg(git_project_path.to_string())
@@ -190,8 +193,16 @@ async fn is_remote_ahead(auth: &GitAuth, git_project_path: &PathType) -> Result<
     let local_commit = String::from_utf8_lossy(&local.stdout).trim().to_string();
     let remote_commit = String::from_utf8_lossy(&remote.stdout).trim().to_string();
 
-    log!(LogLevel::Trace, "Latest commit on remote: {}", truncate(remote_commit.clone(), 8));
-    log!(LogLevel::Trace, "Latest local commit: {}", truncate(local_commit.clone(), 8));
+    log!(
+        LogLevel::Trace,
+        "Latest commit on remote: {}",
+        truncate(remote_commit.clone(), 8)
+    );
+    log!(
+        LogLevel::Trace,
+        "Latest local commit: {}",
+        truncate(local_commit.clone(), 8)
+    );
 
     Ok(local_commit != remote_commit)
 }
