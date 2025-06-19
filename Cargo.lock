@@ -98,7 +98,7 @@ dependencies = [
 
 [[package]]
 name = "ais_gitmon"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "artisan_middleware",
  "base64 0.22.1",

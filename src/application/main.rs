@@ -175,45 +175,6 @@ async fn get_git_credentials(config: &AppConfig) -> Result<GitCredentials, Error
     }
 }
 
-// Process Git repositories, handling existing and new repos
-async fn process_git_repositories(
-    git_credentials: &GitCredentials,
-    state: &mut AppState,
-    state_path: &PathType,
-    monitor: &Option<ResourceMonitorLock>,
-) {
-    let mut credentials_shuffled = git_credentials.clone();
-    let mut rng: StdRng = StdRng::from_entropy();
-    credentials_shuffled.auth_items.shuffle(&mut rng);
-
-    for git_item in credentials_shuffled.auth_items {
-        let git_project_path: PathType = generate_git_project_path(&git_item);
-        if let Err(err) = set_safe_directory(&git_project_path).await {
-            log!(LogLevel::Error, "{}", err.err_mesg)
-        }
-        let result = if git_project_path.exists() {
-            handle_existing_repo(&git_item, &git_project_path).await
-        } else {
-            log!(
-                LogLevel::Warn,
-                "Failed to open: {}, assuming it doesn't exist and cloning.",
-                git_project_path
-            );
-            handle_new_repo(&git_item, &git_project_path).await
-        };
-
-        if let Err(err) = result {
-            log_error(state, err, state_path).await;
-        } else {
-            state.event_counter += 1;
-            state.data = format!("Updated: {}", generate_git_project_id(&git_item));
-            update_state_wrapper(state, &state_path, &monitor).await;
-        }
-
-        sleep(Duration::from_secs(1)).await;
-    }
-}
-
 // Worker that continuously processes a single repository with a random delay
 async fn repo_worker(
     git_item: LockWithTimeout<GitAuth>,
