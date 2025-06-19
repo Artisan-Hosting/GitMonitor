@@ -147,7 +147,8 @@ pub async fn fetch_updates(git_project_path: &PathType) -> Result<(), ErrorArray
             ));
         }
     };
-    let output = Command::new("git")
+
+  let output = Command::new("git")
         .arg("-C")
         .arg(git_project_path.to_string())
         .arg("-c")

@@ -23,6 +23,7 @@ use auth::init_gh_token;
 use git_auth_store::{auth_items, init_auth_box};
 use tokio::{sync::{Mutex, Notify}, time::sleep};
 
+
 mod auth;
 mod config;
 mod git;
@@ -251,5 +252,76 @@ async fn spawn_git_workers(
             let local = tokio::task::LocalSet::new();
             rt.block_on(local.run_until(repo_worker(git_item, st, path, mon, delay)));
         });
+    }
+}
+
+// Worker that continuously processes a single repository with a random delay
+async fn repo_worker(
+    git_item: GitAuth,
+    state: Arc<Mutex<AppState>>,
+    state_path: PathType,
+    monitor: Option<ResourceMonitorLock>,
+    initial_delay: u64,
+) {
+    sleep(Duration::from_secs(initial_delay)).await;
+    let mut rng: StdRng = StdRng::from_entropy();
+    loop {
+        let git_project_path: PathType = generate_git_project_path(&git_item);
+        if let Err(err) = set_safe_directory(&git_project_path).await {
+            log!(LogLevel::Error, "{}", err.err_mesg)
+        }
+
+        let repo_result = match Repository::open(git_project_path.clone()) {
+            Ok(repo) => Ok(repo),
+            Err(err) => Err(ErrorArrayItem::new(Errors::Git, err.message())),
+        };
+
+        let result = match repo_result {
+            Ok(repo) => handle_existing_repo(&git_item, repo, &git_project_path).await,
+            Err(err) => {
+                log!(
+                    LogLevel::Warn,
+                    "Failed tp open: {}, Assuming it doesn't exist and clonning. {}",
+                    git_project_path,
+                    err.err_mesg
+                );
+                handle_new_repo(&git_item, &git_project_path).await
+            }
+        };
+
+        let mut s = state.lock().await;
+        if let Err(err) = result {
+            log_error(&mut s, err, &state_path).await;
+        } else {
+            s.event_counter += 1;
+            s.data = format!("Updated: {}", generate_git_project_id(&git_item));
+            update_state_wrapper(&mut s, &state_path, &monitor).await;
+        }
+        drop(s);
+
+        let wait = rng.gen_range(25..35);
+        sleep(Duration::from_secs(wait)).await;
+    }
+}
+
+// Spawn workers for each repository with slight timer offsets
+async fn spawn_git_workers(
+    git_credentials: &GitCredentials,
+    state: Arc<Mutex<AppState>>,
+    state_path: PathType,
+    monitor: Option<ResourceMonitorLock>,
+) {
+    let mut credentials_shuffled = git_credentials.clone();
+    let mut rng: StdRng = StdRng::from_entropy();
+    credentials_shuffled.auth_items.shuffle(&mut rng);
+
+    for git_item in credentials_shuffled.auth_items {
+		log!(LogLevel::Debug, "Deploying working thread for: {}", generate_git_project_id(&git_item));
+        let delay = rng.gen_range(0..5);
+        let st = state.clone();
+        let path = state_path.clone();
+        let mon = monitor.as_ref().map(|m| m.clone());
+        tokio::task::spawn_local(async move { repo_worker(git_item, st, path, mon, delay).await });
+        sleep(Duration::from_secs(3)).await;
     }
 }
