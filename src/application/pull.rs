@@ -4,20 +4,18 @@ use dusa_collection_utils::types::pathtype::PathType;
 use dusa_collection_utils::types::stringy::Stringy;
 use tokio::process::Command;
 
-use crate::auth::github_token;
+use crate::auth::{github_token, github_auth_header};
 
 /// Pulls the latest changes using `git pull`.
 pub async fn pull_latest_changes(repo_path: &str, branch_name: Stringy) -> std::io::Result<()> {
-    let token: &'static str = match github_token() {
-        Some(t) => t,
+    let header: String = match github_auth_header() {
+        Some(h) => h,
         None => {
             let err =
                 std::io::Error::new(std::io::ErrorKind::Other, "GitHub token not initialized");
             return Err(err);
         }
     };
-
-    let header = format!("Authorization: Bearer {}", token);
     let output = Command::new("git")
         .arg("-C")
         .arg(repo_path)
@@ -27,6 +25,7 @@ pub async fn pull_latest_changes(repo_path: &str, branch_name: Stringy) -> std::
         .arg("origin")
         .arg(branch_name)
         .arg("--rebase")
+        .env("GIT_TERMINAL_PROMPT", "0")
         .output()
         .await?;
 

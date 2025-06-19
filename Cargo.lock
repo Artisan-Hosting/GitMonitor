@@ -101,6 +101,7 @@ name = "ais_gitmon"
 version = "2.3.0"
 dependencies = [
  "artisan_middleware",
+ "base64 0.22.1",
  "colored",
  "config 0.14.1",
  "dusa_collection_utils 3.2.1",

@@ -13,7 +13,7 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 
 use crate::{
-    auth::github_token,
+    auth::github_auth_header,
     pull::{checkout_branch, clone_repo, pull_latest_changes},
 };
 
@@ -138,8 +138,8 @@ pub async fn fetch_updates(git_project_path: &PathType) -> Result<(), ErrorArray
         git_project_path
     );
 
-    let token: &'static str = match github_token() {
-        Some(t) => t,
+    let header: String = match github_auth_header() {
+        Some(h) => h,
         None => {
             return Err(ErrorArrayItem::new(
                 Errors::Git,
@@ -147,8 +147,6 @@ pub async fn fetch_updates(git_project_path: &PathType) -> Result<(), ErrorArray
             ));
         }
     };
-
-    let header = format!("Authorization: Bearer {}", token);
     let output = Command::new("git")
         .arg("-C")
         .arg(git_project_path.to_string())
@@ -156,6 +154,7 @@ pub async fn fetch_updates(git_project_path: &PathType) -> Result<(), ErrorArray
         .arg(format!("http.extraheader={}", header))
         .arg("fetch")
         .arg("origin")
+        .env("GIT_TERMINAL_PROMPT", "0")
         .output()
         .await;
 
