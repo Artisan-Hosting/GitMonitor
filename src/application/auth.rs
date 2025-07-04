@@ -1,6 +1,6 @@
+use base64::{engine::general_purpose, Engine as _};
 use once_cell::sync::OnceCell;
 use std::process::Command;
-use base64::{engine::general_purpose, Engine as _};
 
 static GH_TOKEN: OnceCell<String> = OnceCell::new();
 
@@ -20,18 +20,6 @@ pub fn github_auth_header() -> Option<String> {
         let encoded = general_purpose::STANDARD.encode(creds);
         format!("Authorization: Basic {}", encoded)
     })
-}
-
-static GH_TOKEN: OnceCell<String> = OnceCell::new();
-
-pub fn init_gh_token() -> std::io::Result<()> {
-    let token = get_gh_token()?;
-    let _ = GH_TOKEN.set(token);
-    Ok(())
-}
-
-pub fn github_token() -> Option<&'static str> {
-    GH_TOKEN.get().map(|s| s.as_str())
 }
 
 pub fn get_gh_token() -> std::io::Result<String> {

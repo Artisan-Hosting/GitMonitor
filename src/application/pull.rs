@@ -1,10 +1,12 @@
-use dusa_collection_utils::log;
-use dusa_collection_utils::logger::LogLevel;
-use dusa_collection_utils::types::pathtype::PathType;
-use dusa_collection_utils::types::stringy::Stringy;
+use crate::auth::{github_auth_header, github_token};
+use artisan_middleware::dusa_collection_utils::{
+    core::{
+        logger::LogLevel,
+        types::{pathtype::PathType, stringy::Stringy},
+    },
+    log,
+};
 use tokio::process::Command;
-use crate::auth::{github_token, github_auth_header};
-
 
 /// Pulls the latest changes using `git pull`.
 pub async fn pull_latest_changes(repo_path: &str, branch_name: Stringy) -> std::io::Result<()> {

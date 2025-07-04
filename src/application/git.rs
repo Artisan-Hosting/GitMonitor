@@ -1,13 +1,22 @@
 use artisan_middleware::{
+    dusa_collection_utils::{
+        core::{
+            errors::{ErrorArrayItem, Errors},
+            logger::LogLevel,
+            types::pathtype::PathType,
+        },
+        log,
+        platform::functions::truncate,
+    },
     git_actions::GitAuth,
     users::{get_id, set_file_ownership},
 };
-use dusa_collection_utils::logger::LogLevel;
-use dusa_collection_utils::{
-    errors::{ErrorArrayItem, Errors},
-    types::pathtype::PathType,
-};
-use dusa_collection_utils::{functions::truncate, log};
+// use dusa_collection_utils::logger::LogLevel;
+// use dusa_collection_utils::{
+//     errors::{ErrorArrayItem, Errors},
+//     types::pathtype::PathType,
+// };
+// use dusa_collection_utils::{functions::truncate, log};
 use once_cell::sync::Lazy;
 use tokio::process::Command;
 use tokio::sync::Mutex;
@@ -148,7 +157,7 @@ pub async fn fetch_updates(git_project_path: &PathType) -> Result<(), ErrorArray
         }
     };
 
-  let output = Command::new("git")
+    let output = Command::new("git")
         .arg("-C")
         .arg(git_project_path.to_string())
         .arg("-c")

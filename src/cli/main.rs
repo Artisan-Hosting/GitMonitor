@@ -1,14 +1,15 @@
 use artisan_middleware::{
     cli::{get_user_input, get_user_selection},
     config::AppConfig,
+    dusa_collection_utils::{
+        core::{
+            errors::ErrorArrayItem,
+            logger::{set_log_level, LogLevel},
+            types::{pathtype::PathType, stringy::Stringy},
+        },
+        log,
+    },
     git_actions::{GitAuth, GitCredentials, GitServer},
-};
-use dusa_collection_utils::log;
-use dusa_collection_utils::{
-    errors::ErrorArrayItem,
-    logger::{set_log_level, LogLevel},
-    types::pathtype::PathType,
-    types::stringy::Stringy,
 };
 
 pub fn get_config() -> AppConfig {
