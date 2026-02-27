@@ -15,7 +15,7 @@ use artisan_middleware::{
     resource_monitor::ResourceMonitorLock,
     state_persistence::{log_error, update_state, AppState, StatePersistence},
 };
-use config::{generate_state, get_config, update_state_wrapper};
+use config::{generate_state, get_config, get_git_token_file, update_state_wrapper};
 use git::{handle_existing_repo, handle_new_repo, set_safe_directory};
 use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
 use signals::{sighup_watch, sigusr_watch};
@@ -42,12 +42,14 @@ async fn main() {
 async fn async_main() {
     // Initialization
 
-    if let Err(err) = init_gh_token() {
+    // Loading configs
+    let mut config: AppConfig = get_config();
+    let mut token_file: Option<String> = get_git_token_file();
+
+    if let Err(err) = init_gh_token(token_file.as_deref()) {
         log!(LogLevel::Error, "Failed to load GitHub token: {}", err);
     }
 
-    // Loading configs
-    let mut config: AppConfig = get_config();
     let state_path: PathType = StatePersistence::get_state_path(&config);
     let state: Arc<Mutex<AppState>> = Arc::new(Mutex::new(generate_state(&config).await));
     {
@@ -95,12 +97,12 @@ async fn async_main() {
 
     {
         let mut s = state.lock().await;
-        match init_gh_token() {
+        match init_gh_token(token_file.as_deref()) {
             Ok(_) => {
                 s.data = "Initialized token storage".to_string();
                 s.event_counter += 1;
                 drop(s);
-            },
+            }
             Err(e) => {
                 drop(s);
                 let mut s = state.lock().await;
@@ -154,6 +156,7 @@ async fn async_main() {
             _ = reload.notified() => {
                 sleep(Duration::from_secs(1)).await;
                 config = get_config();
+                token_file = get_git_token_file();
                 let new_state = generate_state(&config).await;
                 {
                     let mut s = state.lock().await;

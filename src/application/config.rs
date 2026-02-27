@@ -11,6 +11,7 @@ use artisan_middleware::resource_monitor::ResourceMonitorLock;
 use artisan_middleware::state_persistence::{self, update_state, AppState, StatePersistence};
 use artisan_middleware::timestamp::current_timestamp;
 use artisan_middleware::version::{aml_version, str_to_version};
+use std::fs;
 
 pub fn get_config() -> AppConfig {
     let mut config: AppConfig = match AppConfig::new() {
@@ -106,6 +107,17 @@ pub async fn generate_state(config: &AppConfig) -> AppState {
 
 pub fn get_state_path(config: &AppConfig) -> PathType {
     state_persistence::StatePersistence::get_state_path(&config)
+}
+
+pub fn get_git_token_file() -> Option<String> {
+    let contents = fs::read_to_string("Overrides.toml").ok()?;
+    let parsed = contents.parse::<toml::Value>().ok()?;
+
+    parsed
+        .get("git")
+        .and_then(|git| git.get("token_file"))
+        .and_then(toml::Value::as_str)
+        .map(str::to_string)
 }
 
 pub async fn update_state_wrapper(
