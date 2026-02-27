@@ -18,6 +18,7 @@ use artisan_middleware::{
 use config::{generate_state, get_config, get_git_token_file, update_state_wrapper};
 use git::{
     cleanup_safe_directory_entries, handle_existing_repo, handle_new_repo, set_safe_directory,
+    RepoSyncOutcome,
 };
 use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
 use signals::{sighup_watch, sigusr_watch};
@@ -226,7 +227,7 @@ async fn repo_worker(
     let mut safe_directory_initialized = false;
     loop {
         let git_project_path: PathType = generate_git_project_path(&git_item);
-        let result: Result<(), ErrorArrayItem> = if git_project_path.exists() {
+        let result: Result<RepoSyncOutcome, ErrorArrayItem> = if git_project_path.exists() {
             if !safe_directory_initialized {
                 match set_safe_directory(&git_project_path).await {
                     Ok(_) => safe_directory_initialized = true,
@@ -248,12 +249,23 @@ async fn repo_worker(
         };
 
         let mut s = state.lock().await;
-        if let Err(err) = result {
-            log_error(&mut s, err, &state_path).await;
-        } else {
-            s.event_counter += 1;
-            s.data = format!("Updated: {}", generate_git_project_id(&git_item));
-            update_state_wrapper(&mut s, &state_path, &monitor).await;
+        match result {
+            Err(err) => {
+                log_error(&mut s, err, &state_path).await;
+            }
+            Ok(outcome) => {
+                let repo_id = generate_git_project_id(&git_item);
+                match outcome {
+                    RepoSyncOutcome::Updated(msg) | RepoSyncOutcome::Cloned(msg) => {
+                        s.event_counter += 1;
+                        s.data = format!("{}: {}", repo_id, msg);
+                    }
+                    RepoSyncOutcome::NoChange(msg) => {
+                        s.data = format!("{}: {}", repo_id, msg);
+                    }
+                }
+                update_state_wrapper(&mut s, &state_path, &monitor).await;
+            }
         }
         drop(s);
 

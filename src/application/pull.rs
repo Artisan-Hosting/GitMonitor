@@ -1,4 +1,4 @@
-use crate::auth::{github_auth_header, github_token};
+use crate::auth::github_token;
 use crate::config::APP_GIT_CONFIG_PATH;
 use artisan_middleware::dusa_collection_utils::{
     core::{
@@ -13,46 +13,6 @@ fn git_cmd() -> Command {
     let mut cmd = Command::new("git");
     cmd.env("GIT_CONFIG_GLOBAL", APP_GIT_CONFIG_PATH);
     cmd
-}
-
-/// Pulls the latest changes using `git pull`.
-pub async fn pull_latest_changes(repo_path: &str, branch_name: Stringy) -> std::io::Result<()> {
-    let header: String = match github_auth_header() {
-        Some(h) => h,
-        None => {
-            let err =
-                std::io::Error::new(std::io::ErrorKind::Other, "GitHub token not initialized");
-            return Err(err);
-        }
-    };
-    let output = git_cmd()
-        .arg("-C")
-        .arg(repo_path)
-        .arg("-c")
-        .arg(format!("http.extraheader={}", header))
-        .arg("pull")
-        .arg("origin")
-        .arg(branch_name)
-        .arg("--rebase")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .await?;
-
-    if output.status.success() {
-        log!(
-            LogLevel::Info,
-            "Successfully pulled latest changes for: {}.",
-            repo_path
-        );
-        Ok(())
-    } else {
-        log!(LogLevel::Error, "Failed to pull changes: {:?}", output);
-        let msg = format!(
-            "git pull failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        Err(std::io::Error::new(std::io::ErrorKind::Other, msg))
-    }
 }
 
 /// Clones the repository if it does not exist.

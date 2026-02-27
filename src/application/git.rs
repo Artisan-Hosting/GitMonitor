@@ -25,14 +25,27 @@ use tokio::sync::Mutex;
 use crate::{
     auth::github_auth_header,
     config::{APP_CONFIG_DIR, APP_GIT_CONFIG_PATH},
-    pull::{checkout_branch, clone_repo, pull_latest_changes},
+    pull::{checkout_branch, clone_repo},
 };
+
+pub enum RepoSyncOutcome {
+    Updated(String),
+    NoChange(String),
+    Cloned(String),
+}
+
+struct UpdateDecision {
+    should_update: bool,
+    reason: String,
+    local_commit: String,
+    remote_commit: String,
+}
 
 // Handle an existing repo: fetch, pull if upstream is ahead, set tracking, restart if needed
 pub async fn handle_existing_repo(
     auth: &GitAuth,
     git_project_path: &PathType,
-) -> Result<(), ErrorArrayItem> {
+) -> Result<RepoSyncOutcome, ErrorArrayItem> {
     log!(
         LogLevel::Trace,
         "Working on existing git repo {}",
@@ -41,36 +54,50 @@ pub async fn handle_existing_repo(
 
     fetch_updates(git_project_path).await?;
 
-    let remote_ahead: bool = match is_remote_ahead(auth, git_project_path).await {
-        Ok(b) => Ok(b),
+    let decision: UpdateDecision = match evaluate_update_decision(auth, git_project_path).await {
+        Ok(d) => Ok(d),
         Err(err) => Err(ErrorArrayItem::new(Errors::Git, err.to_string())),
     }?;
 
-    if remote_ahead {
-        checkout_branch(git_project_path.to_str().unwrap(), auth.branch.clone())
-            .await
-            .map_err(ErrorArrayItem::from)?;
+    let local_short = truncate(decision.local_commit.clone(), 8);
+    let remote_short = truncate(decision.remote_commit.clone(), 8);
 
-        pull_latest_changes(git_project_path.to_str().unwrap(), auth.branch.clone())
+    if decision.should_update {
+        log!(
+            LogLevel::Info,
+            "{} requires sync (reason: {}, local: {}, remote: {})",
+            auth.generate_id(),
+            decision.reason,
+            local_short,
+            remote_short
+        );
+
+        checkout_branch(git_project_path.to_str().unwrap(), auth.branch.clone())
             .await
             .map_err(ErrorArrayItem::from)?;
 
         log!(
             LogLevel::Info,
-            "{} Updated, runner should rebuild this shortly.",
+            "{} synced, runner should rebuild this shortly.",
             auth.generate_id()
         );
+        Ok(RepoSyncOutcome::Updated(format!(
+            "Synced to origin/{} ({}) because {} (local was {})",
+            auth.branch, remote_short, decision.reason, local_short
+        )))
     } else {
         log!(LogLevel::Info, "{}: Up to date !", auth.generate_id());
+        Ok(RepoSyncOutcome::NoChange(format!(
+            "No sync needed ({} == origin/{})",
+            local_short, auth.branch
+        )))
     }
-
-    Ok(())
 }
 
 pub async fn handle_new_repo(
     auth: &GitAuth,
     git_project_path: &PathType,
-) -> Result<(), ErrorArrayItem> {
+) -> Result<RepoSyncOutcome, ErrorArrayItem> {
     // Clone the repository
     let repo_url = auth.assemble_remote_url();
     clone_repo(&repo_url, git_project_path)
@@ -88,7 +115,10 @@ pub async fn handle_new_repo(
         .await
         .map_err(ErrorArrayItem::from)?;
 
-    Ok(())
+    Ok(RepoSyncOutcome::Cloned(format!(
+        "Cloned and checked out origin/{}",
+        auth.branch
+    )))
 }
 
 static SAFE_DIR_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
@@ -319,29 +349,76 @@ pub async fn fetch_updates(git_project_path: &PathType) -> Result<(), ErrorArray
     }
 }
 
-// Check if the upstream branch is ahead of the local branch
-async fn is_remote_ahead(
+async fn rev_parse_ref(
+    git_project_path: &PathType,
+    reference: &str,
+) -> Result<String, std::io::Error> {
+    let output = git_cmd()
+        .arg("-C")
+        .arg(git_project_path.to_string())
+        .arg("rev-parse")
+        .arg(reference)
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!(
+                "git rev-parse '{}' failed: {}",
+                reference,
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        ));
+    }
+
+    let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if commit.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("git rev-parse '{}' returned empty output", reference),
+        ));
+    }
+
+    Ok(commit)
+}
+
+async fn is_ancestor(
+    git_project_path: &PathType,
+    ancestor: &str,
+    descendant: &str,
+) -> Result<bool, std::io::Error> {
+    let output = git_cmd()
+        .arg("-C")
+        .arg(git_project_path.to_string())
+        .arg("merge-base")
+        .arg("--is-ancestor")
+        .arg(ancestor)
+        .arg(descendant)
+        .output()
+        .await?;
+
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!(
+                "git merge-base --is-ancestor failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        )),
+    }
+}
+
+// Decide whether repo should be synced to origin/<branch>.
+async fn evaluate_update_decision(
     auth: &GitAuth,
     git_project_path: &PathType,
-) -> Result<bool, std::io::Error> {
-    let local = git_cmd()
-        .arg("-C")
-        .arg(git_project_path.to_string())
-        .arg("rev-parse")
-        .arg("HEAD")
-        .output()
-        .await?;
-
-    let remote = git_cmd()
-        .arg("-C")
-        .arg(git_project_path.to_string())
-        .arg("rev-parse")
-        .arg(format!("origin/{}", auth.branch))
-        .output()
-        .await?;
-
-    let local_commit = String::from_utf8_lossy(&local.stdout).trim().to_string();
-    let remote_commit = String::from_utf8_lossy(&remote.stdout).trim().to_string();
+) -> Result<UpdateDecision, std::io::Error> {
+    let local_commit = rev_parse_ref(git_project_path, "HEAD").await?;
+    let remote_ref = format!("origin/{}", auth.branch);
+    let remote_commit = rev_parse_ref(git_project_path, &remote_ref).await?;
 
     log!(
         LogLevel::Trace,
@@ -354,5 +431,30 @@ async fn is_remote_ahead(
         truncate(local_commit.clone(), 8)
     );
 
-    Ok(local_commit != remote_commit)
+    if local_commit == remote_commit {
+        return Ok(UpdateDecision {
+            should_update: false,
+            reason: "already at remote HEAD".to_string(),
+            local_commit,
+            remote_commit,
+        });
+    }
+
+    let local_is_ancestor = is_ancestor(git_project_path, &local_commit, &remote_commit).await?;
+    let remote_is_ancestor = is_ancestor(git_project_path, &remote_commit, &local_commit).await?;
+
+    let reason = if local_is_ancestor {
+        "remote ahead".to_string()
+    } else if remote_is_ancestor {
+        "local drift detected (local ahead)".to_string()
+    } else {
+        "history diverged".to_string()
+    };
+
+    Ok(UpdateDecision {
+        should_update: true,
+        reason,
+        local_commit,
+        remote_commit,
+    })
 }
