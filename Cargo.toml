@@ -4,7 +4,7 @@ version = "2.4.1"
 edition = "2021"
 
 [dependencies]
-#artisan_middleware = "5.3.0"
+#artisan_middleware = "5.6.0"
 artisan_middleware = {path = "/opt/artisan/lib/artisan_lib"}
 config = "0.14.0"
 serde = "1.0.210"

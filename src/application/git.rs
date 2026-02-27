@@ -18,11 +18,13 @@ use artisan_middleware::{
 // };
 // use dusa_collection_utils::{functions::truncate, log};
 use once_cell::sync::Lazy;
+use std::{collections::HashSet, fs, path::Path};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
 use crate::{
     auth::github_auth_header,
+    config::{APP_CONFIG_DIR, APP_GIT_CONFIG_PATH},
     pull::{checkout_branch, clone_repo, pull_latest_changes},
 };
 
@@ -91,19 +93,43 @@ pub async fn handle_new_repo(
 
 static SAFE_DIR_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
-// Set the git project as a safe directory
-pub async fn set_safe_directory(git_project_path: &PathType) -> Result<(), ErrorArrayItem> {
-    log!(
-        LogLevel::Trace,
-        "Setting safe dir for {}",
-        git_project_path.to_string()
-    );
+fn git_cmd() -> Command {
+    let mut cmd = Command::new("git");
+    cmd.env("GIT_CONFIG_GLOBAL", APP_GIT_CONFIG_PATH);
+    cmd
+}
 
-    let path = git_project_path.to_string();
-    let _guard = SAFE_DIR_LOCK.lock().await;
+fn ensure_central_git_config() -> Result<(), ErrorArrayItem> {
+    fs::create_dir_all(APP_CONFIG_DIR)
+        .map_err(|e| ErrorArrayItem::new(Errors::Git, e.to_string()))?;
 
-    // Check if already marked safe
-    let check = Command::new("git")
+    if !Path::new(APP_GIT_CONFIG_PATH).exists() {
+        fs::File::create(APP_GIT_CONFIG_PATH)
+            .map_err(|e| ErrorArrayItem::new(Errors::Git, e.to_string()))?;
+    }
+
+    Ok(())
+}
+
+fn normalize_path(path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed == "/" {
+        return "/".to_string();
+    }
+    trimmed.trim_end_matches('/').to_string()
+}
+
+fn canonicalize_or_normalize(path: &str) -> String {
+    match fs::canonicalize(path) {
+        Ok(p) => normalize_path(&p.to_string_lossy()),
+        Err(_) => normalize_path(path),
+    }
+}
+
+pub async fn cleanup_safe_directory_entries() -> Result<(), ErrorArrayItem> {
+    ensure_central_git_config()?;
+
+    let output = git_cmd()
         .arg("config")
         .arg("--global")
         .arg("--get-all")
@@ -112,14 +138,129 @@ pub async fn set_safe_directory(git_project_path: &PathType) -> Result<(), Error
         .await
         .map_err(|e| ErrorArrayItem::new(Errors::Git, e.to_string()))?;
 
-    if check.status.success() {
-        let existing = String::from_utf8_lossy(&check.stdout);
-        if existing.lines().any(|l| l.trim() == path) {
+    if !output.status.success() {
+        if output.status.code() == Some(1) {
             return Ok(());
+        }
+        return Err(ErrorArrayItem::new(
+            Errors::Git,
+            format!(
+                "Failed to read safe.directory entries: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        ));
+    }
+
+    let raw_entries: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+
+    if raw_entries.is_empty() {
+        return Ok(());
+    }
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut deduped: Vec<String> = Vec::new();
+    let mut rewrite_needed = false;
+
+    for entry in &raw_entries {
+        let canonical = canonicalize_or_normalize(entry);
+        if canonical != *entry {
+            rewrite_needed = true;
+        }
+        if seen.insert(canonical.clone()) {
+            deduped.push(canonical);
+        } else {
+            rewrite_needed = true;
         }
     }
 
-    let status = Command::new("git")
+    if !rewrite_needed {
+        return Ok(());
+    }
+
+    let unset_status = git_cmd()
+        .arg("config")
+        .arg("--global")
+        .arg("--unset-all")
+        .arg("safe.directory")
+        .status()
+        .await
+        .map_err(|e| ErrorArrayItem::new(Errors::Git, e.to_string()))?;
+
+    if !unset_status.success() && unset_status.code() != Some(5) {
+        return Err(ErrorArrayItem::new(
+            Errors::Git,
+            "Failed to clear existing safe.directory entries".to_string(),
+        ));
+    }
+
+    for entry in deduped {
+        let add_status = git_cmd()
+            .arg("config")
+            .arg("--global")
+            .arg("--add")
+            .arg("safe.directory")
+            .arg(&entry)
+            .status()
+            .await
+            .map_err(|e| ErrorArrayItem::new(Errors::Git, e.to_string()))?;
+
+        if !add_status.success() {
+            return Err(ErrorArrayItem::new(
+                Errors::Git,
+                format!("Failed to add safe.directory entry '{}'", entry),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+// Set the git project as a safe directory
+pub async fn set_safe_directory(git_project_path: &PathType) -> Result<(), ErrorArrayItem> {
+    log!(
+        LogLevel::Trace,
+        "Setting safe dir for {}",
+        git_project_path.to_string()
+    );
+
+    ensure_central_git_config()?;
+
+    let path = canonicalize_or_normalize(&git_project_path.to_string());
+    let _guard = SAFE_DIR_LOCK.lock().await;
+
+    // Check if already marked safe
+    let check = git_cmd()
+        .arg("config")
+        .arg("--global")
+        .arg("--get")
+        .arg("--fixed-value")
+        .arg("safe.directory")
+        .arg(&path)
+        .output()
+        .await
+        .map_err(|e| ErrorArrayItem::new(Errors::Git, e.to_string()))?;
+
+    if check.status.success() {
+        return Ok(());
+    }
+
+    if check.status.code() != Some(1) {
+        return Err(ErrorArrayItem::new(
+            Errors::Git,
+            format!(
+                "Failed checking safe.directory for '{}': {}",
+                path,
+                String::from_utf8_lossy(&check.stderr)
+            ),
+        ));
+    }
+
+    let status = git_cmd()
         .arg("config")
         .arg("--global")
         .arg("--add")
@@ -157,7 +298,7 @@ pub async fn fetch_updates(git_project_path: &PathType) -> Result<(), ErrorArray
         }
     };
 
-    let output = Command::new("git")
+    let output = git_cmd()
         .arg("-C")
         .arg(git_project_path.to_string())
         .arg("-c")
@@ -183,7 +324,7 @@ async fn is_remote_ahead(
     auth: &GitAuth,
     git_project_path: &PathType,
 ) -> Result<bool, std::io::Error> {
-    let local = Command::new("git")
+    let local = git_cmd()
         .arg("-C")
         .arg(git_project_path.to_string())
         .arg("rev-parse")
@@ -191,7 +332,7 @@ async fn is_remote_ahead(
         .output()
         .await?;
 
-    let remote = Command::new("git")
+    let remote = git_cmd()
         .arg("-C")
         .arg(git_project_path.to_string())
         .arg("rev-parse")

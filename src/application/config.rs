@@ -13,6 +13,9 @@ use artisan_middleware::timestamp::current_timestamp;
 use artisan_middleware::version::{aml_version, str_to_version};
 use std::fs;
 
+pub const APP_CONFIG_DIR: &str = "/etc/ais_gitmon";
+pub const APP_GIT_CONFIG_PATH: &str = "/etc/ais_gitmon/gitconfig";
+
 pub fn get_config() -> AppConfig {
     let mut config: AppConfig = match AppConfig::new() {
         Ok(loaded_data) => loaded_data,

@@ -1,4 +1,5 @@
 use crate::auth::{github_auth_header, github_token};
+use crate::config::APP_GIT_CONFIG_PATH;
 use artisan_middleware::dusa_collection_utils::{
     core::{
         logger::LogLevel,
@@ -7,6 +8,12 @@ use artisan_middleware::dusa_collection_utils::{
     log,
 };
 use tokio::process::Command;
+
+fn git_cmd() -> Command {
+    let mut cmd = Command::new("git");
+    cmd.env("GIT_CONFIG_GLOBAL", APP_GIT_CONFIG_PATH);
+    cmd
+}
 
 /// Pulls the latest changes using `git pull`.
 pub async fn pull_latest_changes(repo_path: &str, branch_name: Stringy) -> std::io::Result<()> {
@@ -18,7 +25,7 @@ pub async fn pull_latest_changes(repo_path: &str, branch_name: Stringy) -> std::
             return Err(err);
         }
     };
-    let output = Command::new("git")
+    let output = git_cmd()
         .arg("-C")
         .arg(repo_path)
         .arg("-c")
@@ -65,7 +72,7 @@ pub async fn clone_repo(repo_url: &str, dest_path: &PathType) -> std::io::Result
     };
 
     let url_with_token = repo_url.replace("https://", &format!("https://oauth2:{}@", token));
-    let output = Command::new("git")
+    let output = git_cmd()
         .arg("clone")
         .arg(url_with_token)
         .arg(dest_path.to_string())
@@ -86,7 +93,7 @@ pub async fn clone_repo(repo_url: &str, dest_path: &PathType) -> std::io::Result
 /// Switches to the specified branch.
 pub async fn checkout_branch(repo_path: &str, branch_name: Stringy) -> std::io::Result<()> {
     let branch = branch_name.to_string();
-    let output = Command::new("git")
+    let output = git_cmd()
         .arg("-C")
         .arg(repo_path)
         .arg("checkout")

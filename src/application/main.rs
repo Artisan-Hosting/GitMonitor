@@ -16,7 +16,9 @@ use artisan_middleware::{
     state_persistence::{log_error, update_state, AppState, StatePersistence},
 };
 use config::{generate_state, get_config, get_git_token_file, update_state_wrapper};
-use git::{handle_existing_repo, handle_new_repo, set_safe_directory};
+use git::{
+    cleanup_safe_directory_entries, handle_existing_repo, handle_new_repo, set_safe_directory,
+};
 use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
 use signals::{sighup_watch, sigusr_watch};
 
@@ -44,10 +46,17 @@ async fn async_main() {
 
     // Loading configs
     let mut config: AppConfig = get_config();
-    let mut token_file: Option<String> = get_git_token_file();
+    let token_file: Option<String> = get_git_token_file();
 
     if let Err(err) = init_gh_token(token_file.as_deref()) {
         log!(LogLevel::Error, "Failed to load GitHub token: {}", err);
+    }
+    if let Err(err) = cleanup_safe_directory_entries().await {
+        log!(
+            LogLevel::Error,
+            "Failed to cleanup safe.directory entries: {}",
+            err
+        );
     }
 
     let state_path: PathType = StatePersistence::get_state_path(&config);
@@ -156,7 +165,6 @@ async fn async_main() {
             _ = reload.notified() => {
                 sleep(Duration::from_secs(1)).await;
                 config = get_config();
-                token_file = get_git_token_file();
                 let new_state = generate_state(&config).await;
                 {
                     let mut s = state.lock().await;
@@ -215,13 +223,16 @@ async fn repo_worker(
 ) {
     sleep(Duration::from_secs(initial_delay)).await;
     let mut rng: StdRng = StdRng::from_entropy();
+    let mut safe_directory_initialized = false;
     loop {
         let git_project_path: PathType = generate_git_project_path(&git_item);
-        if let Err(err) = set_safe_directory(&git_project_path).await {
-            log!(LogLevel::Error, "{}", err.err_mesg)
-        }
-
         let result: Result<(), ErrorArrayItem> = if git_project_path.exists() {
+            if !safe_directory_initialized {
+                match set_safe_directory(&git_project_path).await {
+                    Ok(_) => safe_directory_initialized = true,
+                    Err(err) => log!(LogLevel::Error, "{}", err.err_mesg),
+                }
+            }
             handle_existing_repo(&git_item, &git_project_path).await
         } else {
             log!(
@@ -229,7 +240,11 @@ async fn repo_worker(
                 "Failed tp open: {}, Assuming it doesn't exist and clonning.",
                 git_project_path,
             );
-            handle_new_repo(&git_item, &git_project_path).await
+            let result = handle_new_repo(&git_item, &git_project_path).await;
+            if result.is_ok() {
+                safe_directory_initialized = true;
+            }
+            result
         };
 
         let mut s = state.lock().await;
