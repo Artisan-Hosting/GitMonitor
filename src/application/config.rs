@@ -125,8 +125,30 @@ pub fn get_state_path(config: &AppConfig) -> PathType {
 }
 
 pub fn get_git_token_file() -> Option<String> {
-    let contents = fs::read_to_string("Overrides.toml").ok()?;
-    let parsed = contents.parse::<toml::Value>().ok()?;
+    let contents = match fs::read_to_string("Overrides.toml") {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(err) => {
+            log!(
+                LogLevel::Warn,
+                "Failed to read Overrides.toml while locating the GitHub token file: {}",
+                err
+            );
+            return None;
+        }
+    };
+
+    let parsed = match contents.parse::<toml::Value>() {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            log!(
+                LogLevel::Warn,
+                "Failed to parse Overrides.toml while locating the GitHub token file: {}",
+                err
+            );
+            return None;
+        }
+    };
 
     parsed
         .get("git")
