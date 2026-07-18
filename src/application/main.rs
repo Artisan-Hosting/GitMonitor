@@ -82,7 +82,7 @@ async fn async_main() {
         );
         err.to_string()
     });
-    let token_initialized = token_init_error.is_none();
+    let mut token_initialized = token_init_error.is_none();
     if let Err(err) = cleanup_safe_directory_entries().await {
         log!(
             LogLevel::Error,
@@ -121,6 +121,8 @@ async fn async_main() {
 
     sighup_watch(reload.clone());
     sigusr_watch(exit_graceful.clone());
+    let mut token_retry_interval = tokio::time::interval(Duration::from_secs(30));
+    token_retry_interval.tick().await;
 
     // Load Git credentials
     let git_credentials: GitCredentials = {
@@ -137,12 +139,21 @@ async fn async_main() {
     };
 
     {
+        let s = state.lock().await;
+        log!(
+            LogLevel::Debug,
+            "Global application state after Git credentials load:\n{:#?}",
+            *s
+        );
+    }
+
+    {
         let mut s = state.lock().await;
-        if let Some(error) = token_init_error {
+        if let Some(error) = token_init_error.as_ref() {
             s.data =
                 "Git monitor initialized without a GitHub token; clone/fetch operations will retry"
                     .to_string();
-            let error = ErrorArrayItem::new(Errors::Git, error);
+            let error = ErrorArrayItem::new(Errors::Git, error.clone());
             log_error(&mut s, error, &state_path).await;
         } else {
             s.data = "Initialized GitHub token storage".to_string();
@@ -240,6 +251,30 @@ async fn async_main() {
                 let mut s = state.lock().await;
                 s.status = Status::Running;
                 update_state_wrapper(&mut s, &state_path, &monitor).await;
+            }
+
+            _ = token_retry_interval.tick(), if !token_initialized => {
+                match init_gh_token(token_file.as_deref()) {
+                    Ok(()) => {
+                        token_initialized = true;
+                        log!(
+                            LogLevel::Info,
+                            "GitHub token loaded successfully during retry"
+                        );
+
+                        let mut s = state.lock().await;
+                        s.data = String::from("Git monitor is initialized");
+                        s.event_counter += 1;
+                        update_state_wrapper(&mut s, &state_path, &monitor).await;
+                    }
+                    Err(err) => {
+                        log!(
+                            LogLevel::Warn,
+                            "Failed to load GitHub token during retry; repository operations will keep retrying: {}",
+                            err
+                        );
+                    }
+                }
             }
         }
     }
