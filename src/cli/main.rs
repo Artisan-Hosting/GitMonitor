@@ -21,8 +21,18 @@ use std::{
 
 const AIS_REPO_ROOT: &str = "/var/www/ais";
 
+#[path = "../application/auth.rs"]
+mod auth;
+#[allow(dead_code)]
+#[path = "../application/config.rs"]
+mod config;
+#[allow(dead_code)]
+#[path = "../application/git.rs"]
+mod git;
 #[path = "../git_config.rs"]
 mod git_config;
+#[path = "../application/pull.rs"]
+mod pull;
 
 pub fn get_config() -> AppConfig {
     let mut config: AppConfig = match AppConfig::new() {
@@ -216,14 +226,16 @@ fn force_sync_checkout(auth: &GitAuth, git_project_path: &Path) -> Result<(), St
     Ok(())
 }
 
-fn audit_configured_checkouts(git_credentials: &GitCredentials, force_sync: bool) -> bool {
+async fn audit_configured_checkouts(git_credentials: &GitCredentials, force_sync: bool) -> bool {
     let mut ready = 0_usize;
+    let mut cloned = 0_usize;
     let mut missing = 0_usize;
     let mut invalid = 0_usize;
     let mut sync_failed = 0_usize;
 
     for auth in &git_credentials.auth_items {
-        let git_project_path = PathBuf::from(generate_git_project_path(auth).to_string());
+        let generated_path = generate_git_project_path(auth);
+        let git_project_path = PathBuf::from(generated_path.to_string());
         let repo_id = auth.generate_id();
 
         match inspect_checkout(&git_project_path) {
@@ -256,13 +268,27 @@ fn audit_configured_checkouts(git_credentials: &GitCredentials, force_sync: bool
                 );
             }
             CheckoutAudit::Missing => {
-                missing += 1;
                 log!(
                     LogLevel::Warn,
-                    "{}: checkout missing at {}",
+                    "{}: checkout missing at {}; cloning from git.cf",
                     repo_id,
                     git_project_path.display()
                 );
+                match git::handle_new_repo(auth, &generated_path).await {
+                    Ok(_) => {
+                        cloned += 1;
+                        log!(
+                            LogLevel::Info,
+                            "{}: clone complete at {}",
+                            repo_id,
+                            git_project_path.display()
+                        );
+                    }
+                    Err(err) => {
+                        missing += 1;
+                        log!(LogLevel::Error, "{}: clone failed: {}", repo_id, err);
+                    }
+                }
             }
             CheckoutAudit::Invalid(reason) => {
                 invalid += 1;
@@ -279,8 +305,9 @@ fn audit_configured_checkouts(git_credentials: &GitCredentials, force_sync: bool
 
     log!(
         LogLevel::Info,
-        "Checkout audit complete: {} ready, {} missing, {} invalid, {} sync failures",
+        "Checkout audit complete: {} ready, {} cloned, {} missing after clone attempt, {} invalid, {} sync failures",
         ready,
+        cloned,
         missing,
         invalid,
         sync_failed
@@ -316,7 +343,7 @@ async fn main() {
     println!("3. Append data to git credential file");
     println!("4. Remove data from git credential file");
     println!("5. Clean all stale repository checkouts");
-    println!("6. Audit configured repository checkouts");
+    println!("6. Audit and clone configured repository checkouts");
 
     loop {
         let choice: String = get_user_input("Enter number of desired action: ").to_string();
@@ -545,17 +572,23 @@ async fn main() {
                     std::process::exit(1)
                 }
 
+                if let Err(err) = auth::init_gh_token(config::get_git_token_file().as_deref()) {
+                    log!(
+                        LogLevel::Error,
+                        "Failed to load GitHub token; missing repository clones may fail: {}",
+                        err
+                    );
+                }
+
                 let force_sync =
                     get_yes_no("Force sync valid checkouts to their configured origin branches");
-                if audit_configured_checkouts(&git_credentials, force_sync) {
+                if audit_configured_checkouts(&git_credentials, force_sync).await {
                     std::process::exit(0)
                 } else {
-                    if !force_sync {
-                        log!(
-                            LogLevel::Warn,
-                            "Missing repositories will be cloned by the monitor on its next reconciliation cycle"
-                        );
-                    }
+                    log!(
+                        LogLevel::Warn,
+                        "Unresolved repository checkouts will be retried by the monitor on its next reconciliation cycle"
+                    );
                     std::process::exit(2)
                 }
             }
