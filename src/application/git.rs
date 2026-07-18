@@ -70,6 +70,30 @@ struct UpdateDecision {
     remote_commit: String,
 }
 
+// Recursively chowns a managed checkout back to www-data. Called after every
+// action that touches a checkout (clone, fetch/checkout, force-resync) so
+// ownership drift introduced by any other process gets corrected within one
+// cycle instead of only ever being set once at initial clone time.
+pub fn enforce_checkout_ownership(git_project_path: &PathType) -> Result<(), ErrorArrayItem> {
+    let webuser = get_id("www-data")?;
+    set_file_ownership(git_project_path, webuser.0, webuser.1)
+}
+
+// Best-effort wrapper for call sites that must not fail (or abort) a sync
+// cycle just because ownership repair failed -- e.g. www-data doesn't exist
+// on this box, or we're not running with chown privileges.
+fn reassert_checkout_ownership(repo_id: &str, git_project_path: &PathType) {
+    if let Err(err) = enforce_checkout_ownership(git_project_path) {
+        log!(
+            LogLevel::Warn,
+            "{}: failed to re-assert www-data ownership on '{}': {}",
+            repo_id,
+            git_project_path,
+            err.err_mesg
+        );
+    }
+}
+
 // Handle an existing repo: fetch, pull if upstream is ahead, set tracking, restart if needed
 pub async fn handle_existing_repo(
     auth: &GitAuth,
@@ -153,6 +177,10 @@ pub async fn handle_existing_repo(
         }
     }
 
+    // Re-assert ownership every cycle (not just NoChange runs) so drift from
+    // any out-of-band write to the checkout gets caught on the next poll.
+    reassert_checkout_ownership(&auth.generate_id(), git_project_path);
+
     Ok(outcome)
 }
 
@@ -169,8 +197,7 @@ pub async fn handle_new_repo(
         .map_err(|err| ErrorArrayItem::new(Errors::Git, err.to_string()))?;
 
     // Set ownership to the web user
-    let webuser = get_id("www-data")?;
-    set_file_ownership(&git_project_path, webuser.0, webuser.1)?;
+    enforce_checkout_ownership(git_project_path)?;
 
     // Set safe directory
     set_safe_directory(git_project_path).await?;
@@ -188,6 +215,11 @@ pub async fn handle_new_repo(
         );
         err
     })?;
+
+    // Submodule init/update and checkout can lay down new files after the
+    // initial chown above, so re-assert ownership once more before handing
+    // the checkout back as ready.
+    enforce_checkout_ownership(git_project_path)?;
 
     Ok(RepoSyncOutcome::Cloned(format!(
         "Cloned and checked out origin/{}",

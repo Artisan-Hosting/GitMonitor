@@ -249,6 +249,22 @@ fn force_sync_checkout(auth: &GitAuth, git_project_path: &Path) -> Result<(), St
     Ok(())
 }
 
+// Best-effort: chown drift shouldn't mask a successful git sync (or block an
+// audit-only pass), but it should always be logged so an operator notices.
+fn reassert_checkout_ownership(repo_id: &str, git_project_path: &Path) {
+    if let Err(err) =
+        git::enforce_checkout_ownership(&PathType::from(git_project_path.to_path_buf()))
+    {
+        log!(
+            LogLevel::Warn,
+            "{}: failed to re-assert www-data ownership on '{}': {}",
+            repo_id,
+            git_project_path.display(),
+            err
+        );
+    }
+}
+
 async fn audit_configured_checkouts(git_credentials: &GitCredentials, force_sync: bool) -> bool {
     let mut ready = 0_usize;
     let mut cloned = 0_usize;
@@ -273,6 +289,7 @@ async fn audit_configured_checkouts(git_credentials: &GitCredentials, force_sync
                 match force_sync_checkout(auth, &git_project_path) {
                     Ok(()) => {
                         ready += 1;
+                        reassert_checkout_ownership(&repo_id, &git_project_path);
                         log!(LogLevel::Info, "{}: force sync complete", repo_id);
                     }
                     Err(err) => {
@@ -283,6 +300,7 @@ async fn audit_configured_checkouts(git_credentials: &GitCredentials, force_sync
             }
             CheckoutAudit::Ready => {
                 ready += 1;
+                reassert_checkout_ownership(&repo_id, &git_project_path);
                 log!(
                     LogLevel::Info,
                     "{}: checkout ready at {}",
