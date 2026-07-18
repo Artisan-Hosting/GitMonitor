@@ -33,6 +33,9 @@ mod git;
 mod git_config;
 #[path = "../application/pull.rs"]
 mod pull;
+#[cfg(test)]
+#[path = "../application/test_support.rs"]
+mod test_support;
 
 pub fn get_config() -> AppConfig {
     let mut config: AppConfig = match AppConfig::new() {
@@ -149,11 +152,24 @@ enum CheckoutAudit {
 fn git_command(git_project_path: &Path) -> Command {
     let mut command = Command::new("git");
     command
+        .env("GIT_CONFIG_GLOBAL", config::app_git_config_path())
+        .env("GIT_TERMINAL_PROMPT", "0")
         .arg("-c")
         .arg(format!("safe.directory={}", git_project_path.display()))
         .arg("-C")
         .arg(git_project_path);
     command
+}
+
+// Same as `git_command`, but also scopes the GitHub auth header to the
+// invocation via `-c http.extraheader=...` so commands that touch the
+// remote (fetch) don't fall back to an interactive credential prompt.
+fn authenticated_git_command(git_project_path: &Path) -> Result<Command, String> {
+    let header = auth::github_auth_header()
+        .ok_or_else(|| "GitHub token not initialized; run option 6 after credentials are loaded".to_string())?;
+    let mut command = git_command(git_project_path);
+    command.arg("-c").arg(format!("http.extraheader={}", header));
+    Ok(command)
 }
 
 fn inspect_checkout(git_project_path: &Path) -> CheckoutAudit {
@@ -194,9 +210,8 @@ fn inspect_checkout(git_project_path: &Path) -> CheckoutAudit {
     CheckoutAudit::Ready
 }
 
-fn run_git_step(git_project_path: &Path, args: &[&str], step: &str) -> Result<(), String> {
-    let status = git_command(git_project_path)
-        .args(args)
+fn run_command_step(mut command: Command, step: &str) -> Result<(), String> {
+    let status = command
         .status()
         .map_err(|err| format!("{} failed to start: {}", step, err))?;
 
@@ -207,11 +222,19 @@ fn run_git_step(git_project_path: &Path, args: &[&str], step: &str) -> Result<()
     }
 }
 
+fn run_git_step(git_project_path: &Path, args: &[&str], step: &str) -> Result<(), String> {
+    let mut command = git_command(git_project_path);
+    command.args(args);
+    run_command_step(command, step)
+}
+
 fn force_sync_checkout(auth: &GitAuth, git_project_path: &Path) -> Result<(), String> {
     let branch = auth.branch.to_string();
     let remote_branch = format!("origin/{}", branch);
 
-    run_git_step(git_project_path, &["fetch", "origin"], "git fetch")?;
+    let mut fetch = authenticated_git_command(git_project_path)?;
+    fetch.arg("fetch").arg("origin");
+    run_command_step(fetch, "git fetch")?;
     run_git_step(
         git_project_path,
         &["checkout", "-B", &branch, &remote_branch],

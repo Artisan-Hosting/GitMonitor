@@ -13,8 +13,20 @@ use artisan_middleware::timestamp::current_timestamp;
 use artisan_middleware::version::{aml_version, str_to_version};
 use std::fs;
 
-pub const APP_CONFIG_DIR: &str = "/etc/ais_gitmon";
-pub const APP_GIT_CONFIG_PATH: &str = "/etc/ais_gitmon/gitconfig";
+const DEFAULT_APP_CONFIG_DIR: &str = "/etc/ais_gitmon";
+
+/// Root directory for this app's git config/state. Overridable via
+/// `AIS_GITMON_CONFIG_DIR` so tests can run against a hermetic temp
+/// directory instead of the real system path.
+pub fn app_config_dir() -> String {
+    std::env::var("AIS_GITMON_CONFIG_DIR").unwrap_or_else(|_| DEFAULT_APP_CONFIG_DIR.to_string())
+}
+
+/// Path to the git global-config file this app manages (safe.directory
+/// entries, etc.). See [`app_config_dir`] for the override mechanism.
+pub fn app_git_config_path() -> String {
+    format!("{}/gitconfig", app_config_dir())
+}
 
 pub fn get_config() -> AppConfig {
     let mut config: AppConfig = match AppConfig::new() {

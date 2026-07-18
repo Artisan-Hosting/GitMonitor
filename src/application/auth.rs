@@ -75,7 +75,13 @@ fn parse_token(raw: &str) -> Option<String> {
         return None;
     }
 
-    if let Ok(value) = trimmed.parse::<toml::Value>() {
+    // `toml::Value`'s own `FromStr` only accepts a single bare value (a
+    // string, a number, an inline table, ...), not a full document -- a line
+    // like `token = "abc"` would fail to parse there and silently fall
+    // through to the plain-text scan below, returning the raw line intact.
+    // `toml::from_str` parses a whole document, which is what a token file
+    // actually is.
+    if let Ok(value) = toml::from_str::<toml::Value>(trimmed) {
         if let Some(token) = value.get("token").and_then(toml::Value::as_str) {
             let token = token.trim();
             if !token.is_empty() {
@@ -109,4 +115,66 @@ fn parse_token(raw: &str) -> Option<String> {
         .map(str::trim)
         .find(|line| !line.is_empty() && !line.starts_with('#'))
         .map(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_token;
+
+    #[test]
+    fn parses_top_level_token_key() {
+        assert_eq!(
+            parse_token("token = \"abc123\""),
+            Some("abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_nested_git_token_key() {
+        assert_eq!(
+            parse_token("[git]\ntoken = \"nested-git\""),
+            Some("nested-git".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_nested_github_token_key() {
+        assert_eq!(
+            parse_token("[github]\ntoken = \"nested-github\""),
+            Some("nested-github".to_string())
+        );
+    }
+
+    #[test]
+    fn falls_back_to_plain_text_when_not_toml() {
+        assert_eq!(
+            parse_token("just-a-raw-token-string"),
+            Some("just-a-raw-token-string".to_string())
+        );
+    }
+
+    #[test]
+    fn plain_text_skips_comment_and_blank_lines() {
+        let raw = "\n# a comment\n\n  real-token  \nsecond-line-ignored\n";
+        assert_eq!(parse_token(raw), Some("real-token".to_string()));
+    }
+
+    #[test]
+    fn empty_or_whitespace_input_yields_none() {
+        assert_eq!(parse_token(""), None);
+        assert_eq!(parse_token("   \n\t  "), None);
+    }
+
+    #[test]
+    fn toml_table_with_blank_token_falls_back_to_raw_line_scan() {
+        // `token = ""` parses as valid TOML but yields an empty string, which
+        // is treated as absent, so parsing falls through to the plain-text
+        // line scan -- which finds the same raw line and returns it verbatim
+        // rather than yielding None. Documenting this as current behavior,
+        // not asserting it's desirable.
+        assert_eq!(
+            parse_token("token = \"\""),
+            Some("token = \"\"".to_string())
+        );
+    }
 }

@@ -1,5 +1,5 @@
 use crate::auth::github_auth_header;
-use crate::config::APP_GIT_CONFIG_PATH;
+use crate::config::app_git_config_path;
 use artisan_middleware::dusa_collection_utils::{
     core::{
         logger::LogLevel,
@@ -11,7 +11,7 @@ use tokio::process::Command;
 
 fn git_cmd() -> Command {
     let mut cmd = Command::new("git");
-    cmd.env("GIT_CONFIG_GLOBAL", APP_GIT_CONFIG_PATH);
+    cmd.env("GIT_CONFIG_GLOBAL", app_git_config_path());
     cmd
 }
 
@@ -124,4 +124,60 @@ pub async fn checkout_branch(repo_path: &str, branch_name: Stringy) -> std::io::
         branch
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::clone_repo;
+    use crate::auth::github_auth_header;
+    use crate::test_support::{AuthHeaderProbeServer, Sandbox};
+    use serial_test::serial;
+
+    #[tokio::test]
+    #[serial]
+    async fn clone_repo_sends_the_configured_auth_header() {
+        let sandbox = Sandbox::new();
+        let bare = sandbox
+            .seed_origin("acme", "widgets", "main", &[("a.txt", "a")])
+            .await;
+        let probe = AuthHeaderProbeServer::start(bare.parent().unwrap());
+        let clone_url = format!("{}/widgets.git", probe.base_url());
+        let dest = sandbox.checkout_path("widgets-via-probe");
+
+        clone_repo(&clone_url, &dest)
+            .await
+            .expect("clone should succeed");
+
+        let expected_header = github_auth_header().expect("token should be initialized");
+        let expected_value = expected_header
+            .strip_prefix("Authorization: ")
+            .expect("header should be an Authorization line");
+        assert!(
+            probe
+                .received_auth_headers()
+                .iter()
+                .any(|h| h.as_deref() == Some(expected_value)),
+            "expected an Authorization header matching {:?}, got {:?}",
+            expected_value,
+            probe.received_auth_headers()
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn clone_repo_refuses_to_overwrite_an_existing_destination() {
+        let sandbox = Sandbox::new();
+        sandbox
+            .seed_origin("acme", "widgets", "main", &[("a.txt", "a")])
+            .await;
+        let dest = sandbox.checkout_path("widgets-exists");
+        std::fs::create_dir_all(std::path::Path::new(&dest.to_string()))
+            .expect("pre-create destination");
+
+        let result = clone_repo("file:///does/not/matter", &dest).await;
+        assert!(
+            result.is_err(),
+            "clone_repo should refuse an existing destination"
+        );
+    }
 }

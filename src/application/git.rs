@@ -24,7 +24,7 @@ use tokio::sync::Mutex;
 
 use crate::{
     auth::github_auth_header,
-    config::{APP_CONFIG_DIR, APP_GIT_CONFIG_PATH},
+    config::{app_config_dir, app_git_config_path},
     pull::{checkout_branch, clone_repo},
 };
 
@@ -492,6 +492,15 @@ fn canonical_remote_identity(url: &str) -> Option<String> {
 // third-party host referenced by .gitmodules.
 const GITHUB_REMOTE_PREFIX: &str = "https://github.com/";
 
+// Builds the `-c` argument that scopes the auth header to GITHUB_REMOTE_PREFIX
+// only. Split out for direct unit testing: a live round trip can't easily
+// prove the scope matches (redirecting a github.com-scoped request to a
+// local test server changes the request URL, which changes what the scope
+// matches against), so this is verified as a pure string-construction check.
+fn scoped_extraheader_arg(header: &str) -> String {
+    format!("http.{}.extraheader={}", GITHUB_REMOTE_PREFIX, header)
+}
+
 // Initialize and update submodules (if any) to match the superproject's recorded commits.
 async fn sync_submodules(git_project_path: &PathType) -> Result<(), ErrorArrayItem> {
     if !git_project_path.join(".gitmodules").exists() {
@@ -530,10 +539,7 @@ async fn sync_submodules(git_project_path: &PathType) -> Result<(), ErrorArrayIt
         .arg("-C")
         .arg(&path)
         .arg("-c")
-        .arg(format!(
-            "http.{}.extraheader={}",
-            GITHUB_REMOTE_PREFIX, header
-        ))
+        .arg(scoped_extraheader_arg(&header))
         .arg("submodule")
         .arg("update")
         .arg("--init")
@@ -634,16 +640,17 @@ static SAFE_DIR_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 fn git_cmd() -> Command {
     let mut cmd = Command::new("git");
-    cmd.env("GIT_CONFIG_GLOBAL", APP_GIT_CONFIG_PATH);
+    cmd.env("GIT_CONFIG_GLOBAL", app_git_config_path());
     cmd
 }
 
 fn ensure_central_git_config() -> Result<(), ErrorArrayItem> {
-    fs::create_dir_all(APP_CONFIG_DIR)
+    fs::create_dir_all(app_config_dir())
         .map_err(|e| ErrorArrayItem::new(Errors::Git, e.to_string()))?;
 
-    if !Path::new(APP_GIT_CONFIG_PATH).exists() {
-        fs::File::create(APP_GIT_CONFIG_PATH)
+    let git_config_path = app_git_config_path();
+    if !Path::new(&git_config_path).exists() {
+        fs::File::create(&git_config_path)
             .map_err(|e| ErrorArrayItem::new(Errors::Git, e.to_string()))?;
     }
 
@@ -1063,7 +1070,24 @@ async fn evaluate_update_decision(
 
 #[cfg(test)]
 mod tests {
-    use super::{canonical_remote_identity, redact_remote_url, ssh_to_http_url};
+    use super::{
+        canonical_remote_identity, expected_remote_url, redact_remote_url, scoped_extraheader_arg,
+        ssh_to_http_url, GITHUB_REMOTE_PREFIX,
+    };
+    use artisan_middleware::{
+        dusa_collection_utils::core::types::stringy::Stringy,
+        git_actions::{GitAuth, GitServer},
+    };
+
+    fn auth(user: &str, repo: &str, branch: &str, server: GitServer) -> GitAuth {
+        GitAuth {
+            user: Stringy::from(user),
+            repo: Stringy::from(repo),
+            branch: Stringy::from(branch),
+            server,
+            token: None,
+        }
+    }
 
     #[test]
     fn ssh_and_https_urls_have_the_same_repository_identity() {
@@ -1071,6 +1095,28 @@ mod tests {
         let https = canonical_remote_identity("https://github.com/owner/repository.git");
 
         assert_eq!(ssh, https);
+    }
+
+    #[test]
+    fn identity_ignores_trailing_slash_and_host_case() {
+        let a = canonical_remote_identity("https://GitHub.com/owner/repository.git/");
+        let b = canonical_remote_identity("https://github.com/owner/repository.git");
+
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn identity_treats_missing_dot_git_suffix_the_same() {
+        let with_suffix = canonical_remote_identity("https://github.com/owner/repository.git");
+        let without_suffix = canonical_remote_identity("https://github.com/owner/repository");
+
+        assert_eq!(with_suffix, without_suffix);
+    }
+
+    #[test]
+    fn identity_is_none_for_a_pathless_url() {
+        assert_eq!(canonical_remote_identity("https://github.com/"), None);
+        assert_eq!(canonical_remote_identity("not-a-url-at-all"), None);
     }
 
     #[test]
@@ -1086,10 +1132,558 @@ mod tests {
     }
 
     #[test]
+    fn ssh_to_http_url_leaves_already_http_urls_alone() {
+        assert_eq!(
+            ssh_to_http_url("https://github.com/owner/repository.git"),
+            None
+        );
+    }
+
+    #[test]
     fn removes_credentials_before_remote_urls_are_logged() {
         assert_eq!(
             redact_remote_url("https://oauth2:secret@github.com/owner/repository.git"),
             "https://github.com/owner/repository.git"
         );
+    }
+
+    #[test]
+    fn redact_is_a_no_op_for_urls_without_credentials() {
+        assert_eq!(
+            redact_remote_url("https://github.com/owner/repository.git"),
+            "https://github.com/owner/repository.git"
+        );
+    }
+
+    #[test]
+    fn expected_remote_url_for_github() {
+        let a = auth("owner", "repository", "main", GitServer::GitHub);
+        assert_eq!(
+            expected_remote_url(&a),
+            "https://github.com/owner/repository.git"
+        );
+    }
+
+    #[test]
+    fn expected_remote_url_for_gitlab() {
+        let a = auth("owner", "repository", "main", GitServer::GitLab);
+        assert_eq!(
+            expected_remote_url(&a),
+            "https://gitlab.com/owner/repository.git"
+        );
+    }
+
+    #[test]
+    fn expected_remote_url_for_plain_custom_server() {
+        let a = auth(
+            "owner",
+            "repository",
+            "main",
+            GitServer::Custom("https://git.example.internal".to_string()),
+        );
+        assert_eq!(
+            expected_remote_url(&a),
+            "https://git.example.internal/owner/repository.git"
+        );
+    }
+
+    #[test]
+    fn expected_remote_url_rewrites_an_ssh_looking_custom_base() {
+        // A Custom server base that looks like an SSH remote gets run through
+        // the same ssh_to_http_url conversion as everything else, so git.cf
+        // entries pointing at `git@host:path` still resolve to an HTTP(S)
+        // URL this app can actually authenticate against.
+        let a = auth(
+            "owner",
+            "repository",
+            "main",
+            GitServer::Custom("git@git.example.internal:base".to_string()),
+        );
+        assert_eq!(
+            expected_remote_url(&a),
+            "https://git.example.internal/base/owner/repository.git"
+        );
+    }
+
+    #[test]
+    fn expected_remote_url_trims_trailing_slash_on_custom_base() {
+        let a = auth(
+            "owner",
+            "repository",
+            "main",
+            GitServer::Custom("https://git.example.internal/".to_string()),
+        );
+        assert_eq!(
+            expected_remote_url(&a),
+            "https://git.example.internal/owner/repository.git"
+        );
+    }
+
+    #[test]
+    fn submodule_extraheader_is_scoped_to_github_only() {
+        let arg = scoped_extraheader_arg("Authorization: Basic abc123");
+        assert_eq!(
+            arg,
+            format!(
+                "http.{}.extraheader=Authorization: Basic abc123",
+                GITHUB_REMOTE_PREFIX
+            )
+        );
+        // Sanity: the scope prefix really is github.com, not some broader
+        // pattern that would also match e.g. a GitLab or self-hosted URL.
+        assert!(arg.starts_with("http.https://github.com/.extraheader="));
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::{
+        fetch_updates, handle_existing_repo, inspect_repo_checkout, recreate_repo,
+        rewrite_ssh_submodule_urls, sync_submodules, RepoCheckoutState, RepoSyncOutcome,
+    };
+    use crate::test_support::{run_git, run_git_output, Sandbox};
+    use serial_test::serial;
+
+    fn checkout_dir(
+        checkout: &artisan_middleware::dusa_collection_utils::core::types::pathtype::PathType,
+    ) -> std::path::PathBuf {
+        std::path::PathBuf::from(checkout.to_string())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn inspect_repo_checkout_reports_missing_for_a_nonexistent_path() {
+        let sandbox = Sandbox::new();
+        sandbox
+            .seed_origin("acme", "widgets", "main", &[("README.md", "hi")])
+            .await;
+        let auth = sandbox.git_auth("acme", "widgets", "main");
+        let checkout = sandbox.checkout_path("widgets");
+
+        let state = inspect_repo_checkout(&auth, &checkout)
+            .await
+            .expect("inspect should succeed");
+        assert!(matches!(state, RepoCheckoutState::Missing));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn inspect_repo_checkout_reports_ready_for_a_healthy_clone() {
+        let sandbox = Sandbox::new();
+        let bare = sandbox
+            .seed_origin("acme", "widgets", "main", &[("README.md", "hi")])
+            .await;
+        let auth = sandbox.git_auth("acme", "widgets", "main");
+        let checkout = sandbox.checkout_path("widgets");
+        sandbox.clone_checkout(&bare, "main", &checkout).await;
+
+        let state = inspect_repo_checkout(&auth, &checkout)
+            .await
+            .expect("inspect should succeed");
+        assert!(matches!(state, RepoCheckoutState::Ready { .. }));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn inspect_repo_checkout_reports_invalid_for_a_corrupted_git_dir() {
+        let sandbox = Sandbox::new();
+        let bare = sandbox
+            .seed_origin("acme", "widgets", "main", &[("README.md", "hi")])
+            .await;
+        let auth = sandbox.git_auth("acme", "widgets", "main");
+        let checkout = sandbox.checkout_path("widgets");
+        sandbox.clone_checkout(&bare, "main", &checkout).await;
+
+        std::fs::remove_file(checkout_dir(&checkout).join(".git").join("HEAD"))
+            .expect("corrupt the checkout");
+
+        let state = inspect_repo_checkout(&auth, &checkout)
+            .await
+            .expect("inspect should succeed");
+        assert!(matches!(state, RepoCheckoutState::Invalid { .. }));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn inspect_repo_checkout_reports_wrong_remote_when_origin_points_elsewhere() {
+        use crate::test_support::AuthHeaderProbeServer;
+
+        let sandbox = Sandbox::new();
+        sandbox
+            .seed_origin("acme", "widgets", "main", &[("a.txt", "a")])
+            .await;
+        sandbox
+            .seed_origin("acme", "gadgets", "main", &[("b.txt", "b")])
+            .await;
+        // canonical_remote_identity compares host+path, so it needs a
+        // proper hostful URL to tell two repos apart -- a bare local path
+        // or `file:///abs/path` URL has no authority component at all, so
+        // identity comparison degenerates to None == None for any two local
+        // repos (see git_auth's file:// helper; not exercised by this test).
+        let probe = AuthHeaderProbeServer::start(&sandbox.remotes_root());
+        let checkout = sandbox.checkout_path("widgets");
+        run_git(
+            &[],
+            sandbox.path(),
+            &[
+                "clone",
+                "-q",
+                "--branch",
+                "main",
+                &format!("{}/acme/widgets.git", probe.base_url()),
+                &checkout.to_string(),
+            ],
+        )
+        .await;
+
+        // git.cf says this checkout should be "gadgets", but it's actually widgets.
+        let auth_expecting_gadgets =
+            sandbox.git_auth_with_server("acme", "gadgets", "main", &probe.base_url());
+
+        let state = inspect_repo_checkout(&auth_expecting_gadgets, &checkout)
+            .await
+            .expect("inspect should succeed");
+        assert!(matches!(state, RepoCheckoutState::WrongRemote { .. }));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn handle_existing_repo_reports_no_change_when_nothing_moved() {
+        let sandbox = Sandbox::new();
+        let bare = sandbox
+            .seed_origin("acme", "widgets", "main", &[("a.txt", "a")])
+            .await;
+        let auth = sandbox.git_auth("acme", "widgets", "main");
+        let checkout = sandbox.checkout_path("widgets");
+        sandbox.clone_checkout(&bare, "main", &checkout).await;
+
+        let outcome = handle_existing_repo(&auth, &checkout, false)
+            .await
+            .map_err(|e| e.error)
+            .expect("sync should succeed");
+        assert!(matches!(outcome, RepoSyncOutcome::NoChange(_)));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn handle_existing_repo_reports_updated_after_a_new_upstream_commit() {
+        let sandbox = Sandbox::new();
+        let bare = sandbox
+            .seed_origin("acme", "widgets", "main", &[("a.txt", "a")])
+            .await;
+        let auth = sandbox.git_auth("acme", "widgets", "main");
+        let checkout = sandbox.checkout_path("widgets");
+        sandbox.clone_checkout(&bare, "main", &checkout).await;
+
+        let new_sha = sandbox
+            .commit_to_origin(&bare, "main", &[("b.txt", "b")], "add b")
+            .await;
+
+        let outcome = handle_existing_repo(&auth, &checkout, false)
+            .await
+            .map_err(|e| e.error)
+            .expect("sync should succeed");
+        assert!(matches!(outcome, RepoSyncOutcome::Updated(_)));
+
+        let head = run_git_output(&checkout_dir(&checkout), &["rev-parse", "HEAD"]).await;
+        assert_eq!(head.trim(), new_sha);
+        assert!(checkout_dir(&checkout).join("b.txt").exists());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn handle_existing_repo_resets_branch_drift() {
+        let sandbox = Sandbox::new();
+        let bare = sandbox
+            .seed_origin("acme", "widgets", "main", &[("a.txt", "a")])
+            .await;
+        let auth = sandbox.git_auth("acme", "widgets", "main");
+        let checkout = sandbox.checkout_path("widgets");
+        sandbox.clone_checkout(&bare, "main", &checkout).await;
+
+        // Detach HEAD locally so the current branch no longer matches git.cf.
+        run_git(
+            &[],
+            &checkout_dir(&checkout),
+            &["checkout", "--detach", "HEAD"],
+        )
+        .await;
+
+        let outcome = handle_existing_repo(&auth, &checkout, false)
+            .await
+            .map_err(|e| e.error)
+            .expect("sync should succeed");
+        assert!(matches!(outcome, RepoSyncOutcome::Updated(_)));
+
+        let branch = run_git_output(
+            &checkout_dir(&checkout),
+            &["symbolic-ref", "--quiet", "--short", "HEAD"],
+        )
+        .await;
+        assert_eq!(branch.trim(), "main");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn handle_existing_repo_resets_worktree_drift() {
+        let sandbox = Sandbox::new();
+        let bare = sandbox
+            .seed_origin("acme", "widgets", "main", &[("a.txt", "a")])
+            .await;
+        let auth = sandbox.git_auth("acme", "widgets", "main");
+        let checkout = sandbox.checkout_path("widgets");
+        sandbox.clone_checkout(&bare, "main", &checkout).await;
+
+        std::fs::write(checkout_dir(&checkout).join("a.txt"), "modified locally")
+            .expect("simulate local drift");
+
+        let outcome = handle_existing_repo(&auth, &checkout, false)
+            .await
+            .map_err(|e| e.error)
+            .expect("sync should succeed");
+        assert!(matches!(outcome, RepoSyncOutcome::Updated(_)));
+
+        let contents = std::fs::read_to_string(checkout_dir(&checkout).join("a.txt")).unwrap();
+        assert_eq!(
+            contents, "a",
+            "checkout should have been reset to upstream content"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn recreate_repo_refuses_to_touch_an_unmanaged_path() {
+        let sandbox = Sandbox::new();
+        let auth = sandbox.git_auth("acme", "widgets", "main");
+        // Definitely not equal to generate_git_project_path(&auth) (which is
+        // hardcoded to /var/www/ais/<hash>).
+        let checkout = sandbox.checkout_path("widgets");
+        std::fs::create_dir_all(checkout_dir(&checkout)).unwrap();
+        std::fs::write(checkout_dir(&checkout).join("keepme.txt"), "important").unwrap();
+
+        let result = recreate_repo(&auth, &checkout, "test-induced").await;
+        assert!(
+            result.is_err(),
+            "recreate_repo should refuse an unmanaged path"
+        );
+        assert!(
+            checkout_dir(&checkout).join("keepme.txt").exists(),
+            "recreate_repo must not have deleted anything"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn rewrite_ssh_submodule_urls_rewrites_gitmodules_entries_locally() {
+        let sandbox = Sandbox::new();
+        let bare = sandbox
+            .seed_origin("acme", "widgets", "main", &[("a.txt", "a")])
+            .await;
+        let checkout = sandbox.checkout_path("widgets");
+        sandbox.clone_checkout(&bare, "main", &checkout).await;
+
+        // Manually seed a .gitmodules entry with an SSH-style URL -- this
+        // doesn't need a real, initialized submodule; rewrite_ssh_submodule_urls
+        // only reads .gitmodules and rewrites the checkout's local config.
+        run_git(
+            &[],
+            &checkout_dir(&checkout),
+            &[
+                "config",
+                "--file",
+                ".gitmodules",
+                "submodule.sub.url",
+                "git@example.internal:owner/sub.git",
+            ],
+        )
+        .await;
+        run_git(
+            &[],
+            &checkout_dir(&checkout),
+            &[
+                "config",
+                "--file",
+                ".gitmodules",
+                "submodule.sub.path",
+                "sub",
+            ],
+        )
+        .await;
+
+        rewrite_ssh_submodule_urls(&checkout)
+            .await
+            .expect("rewrite should succeed");
+
+        let rewritten = run_git_output(
+            &checkout_dir(&checkout),
+            &["config", "--get", "submodule.sub.url"],
+        )
+        .await;
+        assert_eq!(
+            rewritten.trim(),
+            "https://example.internal/owner/sub.git",
+            "local submodule config should now point at the HTTPS form"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn sync_submodules_initializes_a_reachable_submodule() {
+        use crate::test_support::AuthHeaderProbeServer;
+
+        let sandbox = Sandbox::new();
+        let sub_bare = sandbox
+            .seed_origin("acme", "sublib", "main", &[("lib.txt", "lib contents")])
+            .await;
+        let probe = AuthHeaderProbeServer::start(sub_bare.parent().unwrap());
+        let submodule_url = format!("{}/sublib.git", probe.base_url());
+
+        let super_bare = sandbox
+            .seed_origin("acme", "widgets", "main", &[("a.txt", "a")])
+            .await;
+        sandbox
+            .add_submodule(&super_bare, "main", &submodule_url, "libsub")
+            .await;
+
+        let checkout = sandbox.checkout_path("widgets");
+        sandbox.clone_checkout(&super_bare, "main", &checkout).await;
+
+        sync_submodules(&checkout)
+            .await
+            .expect("submodule sync should succeed");
+
+        assert!(
+            checkout_dir(&checkout)
+                .join("libsub")
+                .join("lib.txt")
+                .exists(),
+            "submodule content should have been fetched and checked out"
+        );
+
+        // This submodule URL is http://127.0.0.1:<port>/..., which never
+        // matches the GITHUB_REMOTE_PREFIX scope -- proving the auth header
+        // doesn't leak to non-GitHub submodule hosts, not just that *some*
+        // fetch succeeded.
+        assert!(
+            probe.received_auth_headers().iter().all(Option::is_none),
+            "no Authorization header should have been sent to a non-GitHub submodule host: {:?}",
+            probe.received_auth_headers()
+        );
+        assert!(
+            probe.request_count() > 0,
+            "the probe server should have seen requests"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn fetch_updates_sends_the_configured_auth_header() {
+        use crate::auth::github_auth_header;
+        use crate::test_support::AuthHeaderProbeServer;
+
+        let sandbox = Sandbox::new();
+        let bare = sandbox
+            .seed_origin("acme", "widgets", "main", &[("a.txt", "a")])
+            .await;
+        let checkout = sandbox.checkout_path("widgets");
+        sandbox.clone_checkout(&bare, "main", &checkout).await;
+
+        // Point the checkout's origin at the probe server instead of the
+        // file:// bare repo, so fetch_updates' real HTTP request (and its
+        // -c http.extraheader=...) actually goes over the wire where it can
+        // be observed, instead of file:// transport (which never touches
+        // HTTP headers at all).
+        let probe = AuthHeaderProbeServer::start(&sandbox.remotes_root());
+        run_git(
+            &[],
+            &checkout_dir(&checkout),
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                &format!("{}/acme/widgets.git", probe.base_url()),
+            ],
+        )
+        .await;
+
+        fetch_updates(&checkout)
+            .await
+            .expect("fetch should succeed");
+
+        let expected_header = github_auth_header().expect("token should be initialized");
+        let expected_value = expected_header
+            .strip_prefix("Authorization: ")
+            .expect("header should be an Authorization line");
+        assert!(
+            probe
+                .received_auth_headers()
+                .iter()
+                .any(|h| h.as_deref() == Some(expected_value)),
+            "expected an Authorization header matching {:?}, got {:?}",
+            expected_value,
+            probe.received_auth_headers()
+        );
+    }
+
+    // handle_new_repo (and recreate_repo, which reclones via handle_new_repo)
+    // unconditionally chown the fresh clone to `www-data`, which needs both
+    // that user to exist and root/CAP_CHOWN -- neither holds on an arbitrary
+    // dev box. These are correct and will run for real wherever the daemon
+    // actually deploys; run them explicitly there with
+    // `cargo test -- --ignored`.
+
+    #[tokio::test]
+    #[serial]
+    #[ignore = "requires a www-data user and chown privileges (root)"]
+    async fn handle_new_repo_clones_and_checks_out_the_configured_branch() {
+        use super::handle_new_repo;
+        use crate::test_support::can_chown_to_www_data;
+
+        if !can_chown_to_www_data() {
+            eprintln!("skipping: cannot chown to www-data on this machine");
+            return;
+        }
+
+        let sandbox = Sandbox::new();
+        sandbox
+            .seed_origin("acme", "widgets", "main", &[("README.md", "hello")])
+            .await;
+        let auth = sandbox.git_auth("acme", "widgets", "main");
+        let checkout = sandbox.checkout_path("widgets");
+
+        let outcome = handle_new_repo(&auth, &checkout)
+            .await
+            .expect("clone should succeed");
+        assert!(matches!(outcome, RepoSyncOutcome::Cloned(_)));
+        assert!(checkout_dir(&checkout).join("README.md").exists());
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[ignore = "requires a www-data user and chown privileges (root)"]
+    async fn recreate_repo_wipes_and_reclones_a_corrupted_checkout() {
+        use crate::test_support::can_chown_to_www_data;
+
+        if !can_chown_to_www_data() {
+            eprintln!("skipping: cannot chown to www-data on this machine");
+            return;
+        }
+
+        let sandbox = Sandbox::new();
+        let bare = sandbox
+            .seed_origin("acme", "widgets", "main", &[("a.txt", "a")])
+            .await;
+        let auth = sandbox.git_auth("acme", "widgets", "main");
+        let checkout = sandbox.checkout_path("widgets");
+        sandbox.clone_checkout(&bare, "main", &checkout).await;
+        std::fs::remove_file(checkout_dir(&checkout).join(".git").join("HEAD")).unwrap();
+        std::fs::write(checkout_dir(&checkout).join("stale-marker.txt"), "old").unwrap();
+
+        let outcome = recreate_repo(&auth, &checkout, "corrupted for test")
+            .await
+            .expect("recreate should succeed");
+        assert!(matches!(outcome, RepoSyncOutcome::Recreated(_)));
+        assert!(!checkout_dir(&checkout).join("stale-marker.txt").exists());
+        assert!(checkout_dir(&checkout).join("a.txt").exists());
     }
 }
