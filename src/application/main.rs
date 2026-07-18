@@ -17,9 +17,10 @@ use artisan_middleware::{
 };
 use config::{generate_state, get_config, get_git_token_file, update_state_wrapper};
 use git::{
-    cleanup_safe_directory_entries, handle_existing_repo, handle_new_repo, set_safe_directory,
-    RepoSyncOutcome,
+    cleanup_safe_directory_entries, handle_existing_repo, handle_new_repo, inspect_repo_checkout,
+    recreate_repo, set_safe_directory, RepoCheckoutState, RepoSyncOutcome,
 };
+use git_config::resolve_git_credentials_path;
 use rand::{rngs::StdRng, seq::SliceRandom, RngExt, SeedableRng};
 use signals::{sighup_watch, sigusr_watch};
 
@@ -33,9 +34,31 @@ use tokio::{
 mod auth;
 mod config;
 mod git;
+#[path = "../git_config.rs"]
+mod git_config;
 // mod git_auth_store;
 mod pull;
 mod signals;
+
+const HEALTHY_REFRESH_MIN_SECS: u64 = 8;
+const HEALTHY_REFRESH_MAX_SECS_EXCLUSIVE: u64 = 13;
+const ERROR_RETRY_BASE_SECS: u64 = 30;
+const ERROR_RETRY_CAP_SECS: u64 = 300;
+const INITIAL_WORKER_JITTER_MAX_SECS_EXCLUSIVE: u64 = 3;
+const WORKER_SPAWN_STAGGER_MILLIS: u64 = 250;
+
+fn healthy_refresh_delay(rng: &mut StdRng) -> u64 {
+    rng.random_range(HEALTHY_REFRESH_MIN_SECS..HEALTHY_REFRESH_MAX_SECS_EXCLUSIVE)
+}
+
+fn error_retry_delay(rng: &mut StdRng, consecutive_failures: u32) -> u64 {
+    let exponent = consecutive_failures.saturating_sub(1).min(4);
+    let base = ERROR_RETRY_BASE_SECS
+        .saturating_mul(1_u64 << exponent)
+        .min(ERROR_RETRY_CAP_SECS);
+    let jitter = rng.random_range(0..=(base / 2));
+    base.saturating_add(jitter).min(ERROR_RETRY_CAP_SECS)
+}
 
 #[tokio::main]
 async fn main() {
@@ -49,9 +72,15 @@ async fn async_main() {
     let mut config: AppConfig = get_config();
     let token_file: Option<String> = get_git_token_file();
 
-    if let Err(err) = init_gh_token(token_file.as_deref()) {
-        log!(LogLevel::Error, "Failed to load GitHub token: {}", err);
-    }
+    let token_init_error = init_gh_token(token_file.as_deref()).err().map(|err| {
+        log!(
+            LogLevel::Error,
+            "Failed to load GitHub token; repository workers will keep retrying: {}",
+            err
+        );
+        err.to_string()
+    });
+    let token_initialized = token_init_error.is_none();
     if let Err(err) = cleanup_safe_directory_entries().await {
         log!(
             LogLevel::Error,
@@ -107,19 +136,15 @@ async fn async_main() {
 
     {
         let mut s = state.lock().await;
-        match init_gh_token(token_file.as_deref()) {
-            Ok(_) => {
-                s.data = "Initialized token storage".to_string();
-                s.event_counter += 1;
-                drop(s);
-            }
-            Err(e) => {
-                drop(s);
-                let mut s = state.lock().await;
-                let e = ErrorArrayItem::new(Errors::Git, e.to_string());
-                log_error(&mut s, e, &state_path).await;
-                std::process::exit(100)
-            }
+        if let Some(error) = token_init_error {
+            s.data =
+                "Git monitor initialized without a GitHub token; clone/fetch operations will retry"
+                    .to_string();
+            let error = ErrorArrayItem::new(Errors::Git, error);
+            log_error(&mut s, error, &state_path).await;
+        } else {
+            s.data = "Initialized GitHub token storage".to_string();
+            s.event_counter += 1;
         }
     }
 
@@ -127,7 +152,13 @@ async fn async_main() {
     {
         let mut s = state.lock().await;
         s.config.git = config.git.clone();
-        s.data = String::from("Git monitor is initialized");
+        s.data = if token_initialized {
+            String::from("Git monitor is initialized")
+        } else {
+            String::from(
+                "Git monitor is initialized without a GitHub token; repository operations will retry",
+            )
+        };
         s.status = Status::Running;
         update_state_wrapper(&mut s, &state_path, &monitor).await;
     }
@@ -148,6 +179,18 @@ async fn async_main() {
     };
 
     log!(LogLevel::Info, "Git monitor initialized");
+    log!(
+        LogLevel::Info,
+        "Repository polling interval is {}-{} seconds with exponential error backoff from {} to {} seconds",
+        HEALTHY_REFRESH_MIN_SECS,
+        HEALTHY_REFRESH_MAX_SECS_EXCLUSIVE - 1,
+        ERROR_RETRY_BASE_SECS,
+        ERROR_RETRY_CAP_SECS
+    );
+    log!(
+        LogLevel::Info,
+        "Repositories removed from git.cf are not deleted automatically; use cli_credential for manual cleanup"
+    );
 
     // Spawn background workers for each repository
     let monitor_clone = monitor.as_ref().map(|m| m.clone());
@@ -202,16 +245,14 @@ async fn async_main() {
 
 // Load Git credentials from the configuration
 async fn get_git_credentials(config: &AppConfig) -> Result<GitCredentials, ErrorArrayItem> {
-    match &config.git {
-        Some(git_config) => {
-            let git_file: PathType = PathType::Str(git_config.credentials_file.clone().into());
-            GitCredentials::new(Some(&git_file)).await
-        }
-        None => Err(ErrorArrayItem::new(
-            Errors::ReadingFile,
-            "Git configuration not found".to_string(),
-        )),
-    }
+    let configured_path = config
+        .git
+        .as_ref()
+        .map(|git_config| git_config.credentials_file.as_str());
+    let git_file = resolve_git_credentials_path(configured_path);
+
+    log!(LogLevel::Debug, "Loading git credentials from {}", git_file);
+    GitCredentials::new(Some(&git_file)).await
 }
 
 // Load Git credentials from the configuration
@@ -225,53 +266,142 @@ async fn repo_worker(
     sleep(Duration::from_secs(initial_delay)).await;
     let mut rng: StdRng = StdRng::from_rng(&mut rand::rng());
     let mut safe_directory_initialized = false;
+    let mut consecutive_failures = 0_u32;
     // Forces one submodule backfill pass for repos that predate submodule
     // support; cleared once a cycle (clone or existing-repo pass) succeeds.
     let mut submodules_backfilled = false;
     loop {
         let git_project_path: PathType = generate_git_project_path(&git_item);
-        let result: Result<RepoSyncOutcome, ErrorArrayItem> = if git_project_path.exists() {
-            if !safe_directory_initialized {
-                match set_safe_directory(&git_project_path).await {
-                    Ok(_) => safe_directory_initialized = true,
-                    Err(err) => log!(LogLevel::Error, "{}", err.err_mesg),
+        let repo_id = generate_git_project_id(&git_item);
+        let result: Result<RepoSyncOutcome, ErrorArrayItem> = match inspect_repo_checkout(
+            &git_item,
+            &git_project_path,
+        )
+        .await
+        {
+            Err(err) => Err(err),
+            Ok(RepoCheckoutState::Missing) => {
+                log!(
+                    LogLevel::Info,
+                    "{}: checkout state=missing path='{}'; cloning from git.cf",
+                    repo_id,
+                    git_project_path
+                );
+                let result = handle_new_repo(&git_item, &git_project_path).await;
+                if result.is_ok() {
+                    safe_directory_initialized = true;
+                    submodules_backfilled = true;
+                }
+                result
+            }
+            Ok(RepoCheckoutState::Invalid { reason }) => {
+                safe_directory_initialized = false;
+                submodules_backfilled = false;
+                recreate_repo(&git_item, &git_project_path, &reason).await
+            }
+            Ok(RepoCheckoutState::WrongRemote { expected, actual }) => {
+                safe_directory_initialized = false;
+                submodules_backfilled = false;
+                let reason = format!(
+                    "origin remote identifies the wrong repository (actual: '{}', expected: '{}')",
+                    actual, expected
+                );
+                recreate_repo(&git_item, &git_project_path, &reason).await
+            }
+            Ok(RepoCheckoutState::Ready { remote }) => {
+                log!(
+                    LogLevel::Debug,
+                    "{}: checkout state=ready path='{}' remote='{}'",
+                    repo_id,
+                    git_project_path,
+                    remote
+                );
+
+                if !safe_directory_initialized {
+                    match set_safe_directory(&git_project_path).await {
+                        Ok(_) => safe_directory_initialized = true,
+                        Err(err) => {
+                            log!(
+                                LogLevel::Error,
+                                "{}: failed to register safe.directory: {}",
+                                repo_id,
+                                err.err_mesg
+                            );
+                            let mut s = state.lock().await;
+                            s.data = format!(
+                                "[repo={} state=configuration-error] safe.directory registration failed",
+                                repo_id
+                            );
+                            log_error(&mut s, err, &state_path).await;
+                            drop(s);
+                            consecutive_failures = consecutive_failures.saturating_add(1);
+                            let wait = error_retry_delay(&mut rng, consecutive_failures);
+                            log!(
+                                LogLevel::Warn,
+                                "{}: retrying in {} seconds after {} consecutive failure(s)",
+                                repo_id,
+                                wait,
+                                consecutive_failures
+                            );
+                            sleep(Duration::from_secs(wait)).await;
+                            continue;
+                        }
+                    }
+                }
+
+                match handle_existing_repo(&git_item, &git_project_path, !submodules_backfilled)
+                    .await
+                {
+                    Ok(outcome) => {
+                        submodules_backfilled = true;
+                        Ok(outcome)
+                    }
+                    Err(sync_error) if sync_error.recreate_checkout => {
+                        safe_directory_initialized = false;
+                        submodules_backfilled = false;
+                        let reason = format!(
+                            "local checkout could not be repaired: {}",
+                            sync_error.error.err_mesg
+                        );
+                        recreate_repo(&git_item, &git_project_path, &reason).await
+                    }
+                    Err(sync_error) => Err(sync_error.error),
                 }
             }
-            let result =
-                handle_existing_repo(&git_item, &git_project_path, !submodules_backfilled).await;
-            if result.is_ok() {
-                submodules_backfilled = true;
-            }
-            result
-        } else {
-            log!(
-                LogLevel::Warn,
-                "Failed tp open: {}, Assuming it doesn't exist and clonning.",
-                git_project_path,
-            );
-            let result = handle_new_repo(&git_item, &git_project_path).await;
-            if result.is_ok() {
-                safe_directory_initialized = true;
-                // handle_new_repo already ran an initial submodule sync.
-                submodules_backfilled = true;
-            }
-            result
         };
 
+        let cycle_failed = result.is_err();
         let mut s = state.lock().await;
         match result {
             Err(err) => {
-                log_error(&mut s, err, &state_path).await;
+                s.data = format!(
+                    "[repo={} state=error path={}] {}",
+                    repo_id, git_project_path, err.err_mesg
+                );
+                let contextual_error = ErrorArrayItem::new(
+                    err.err_type,
+                    format!("{} at '{}': {}", repo_id, git_project_path, err.err_mesg),
+                );
+                log_error(&mut s, contextual_error, &state_path).await;
             }
             Ok(outcome) => {
-                let repo_id = generate_git_project_id(&git_item);
                 match outcome {
-                    RepoSyncOutcome::Updated(msg) | RepoSyncOutcome::Cloned(msg) => {
+                    RepoSyncOutcome::Updated(msg) => {
                         s.event_counter += 1;
-                        s.data = format!("{}: {}", repo_id, msg);
+                        s.data = format!("[repo={} state=synced] {}", repo_id, msg);
+                    }
+                    RepoSyncOutcome::Cloned(msg) => {
+                        s.event_counter += 1;
+                        s.data = format!("[repo={} state=cloned] {}", repo_id, msg);
+                    }
+                    RepoSyncOutcome::Recreated(msg) => {
+                        safe_directory_initialized = true;
+                        submodules_backfilled = true;
+                        s.event_counter += 1;
+                        s.data = format!("[repo={} state=recreated] {}", repo_id, msg);
                     }
                     RepoSyncOutcome::NoChange(msg) => {
-                        s.data = format!("{}: {}", repo_id, msg);
+                        s.data = format!("[repo={} state=ready] {}", repo_id, msg);
                     }
                 }
                 update_state_wrapper(&mut s, &state_path, &monitor).await;
@@ -279,7 +409,22 @@ async fn repo_worker(
         }
         drop(s);
 
-        let wait = rng.random_range(25..35);
+        let wait = if cycle_failed {
+            consecutive_failures = consecutive_failures.saturating_add(1);
+            error_retry_delay(&mut rng, consecutive_failures)
+        } else {
+            consecutive_failures = 0;
+            healthy_refresh_delay(&mut rng)
+        };
+        if cycle_failed {
+            log!(
+                LogLevel::Warn,
+                "{}: retrying in {} seconds after {} consecutive failure(s)",
+                repo_id,
+                wait,
+                consecutive_failures
+            );
+        }
         sleep(Duration::from_secs(wait)).await;
     }
 }
@@ -330,11 +475,11 @@ async fn spawn_git_workers(
             "Deploying working thread for: {}",
             generate_git_project_id(&git_item)
         );
-        let delay = rng.random_range(0..5);
+        let delay = rng.random_range(0..INITIAL_WORKER_JITTER_MAX_SECS_EXCLUSIVE);
         let st = state.clone();
         let path = state_path.clone();
         let mon = monitor.as_ref().map(|m| m.clone());
         tokio::task::spawn_local(async move { repo_worker(git_item, st, path, mon, delay).await });
-        sleep(Duration::from_secs(3)).await;
+        sleep(Duration::from_millis(WORKER_SPAWN_STAGGER_MILLIS)).await;
     }
 }

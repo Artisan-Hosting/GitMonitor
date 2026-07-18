@@ -8,7 +8,7 @@ use artisan_middleware::{
         log,
         platform::functions::truncate,
     },
-    git_actions::GitAuth,
+    git_actions::{generate_git_project_path, GitAuth, GitServer},
     users::{get_id, set_file_ownership},
 };
 // use dusa_collection_utils::logger::LogLevel;
@@ -32,6 +32,35 @@ pub enum RepoSyncOutcome {
     Updated(String),
     NoChange(String),
     Cloned(String),
+    Recreated(String),
+}
+
+pub enum RepoCheckoutState {
+    Missing,
+    Ready { remote: String },
+    Invalid { reason: String },
+    WrongRemote { expected: String, actual: String },
+}
+
+pub struct RepoSyncError {
+    pub error: ErrorArrayItem,
+    pub recreate_checkout: bool,
+}
+
+impl RepoSyncError {
+    fn retry(error: ErrorArrayItem) -> Self {
+        Self {
+            error,
+            recreate_checkout: false,
+        }
+    }
+
+    fn recreate(error: ErrorArrayItem) -> Self {
+        Self {
+            error,
+            recreate_checkout: true,
+        }
+    }
 }
 
 struct UpdateDecision {
@@ -46,19 +75,33 @@ pub async fn handle_existing_repo(
     auth: &GitAuth,
     git_project_path: &PathType,
     force_submodule_sync: bool,
-) -> Result<RepoSyncOutcome, ErrorArrayItem> {
+) -> Result<RepoSyncOutcome, RepoSyncError> {
     log!(
         LogLevel::Trace,
         "Working on existing git repo {}",
         auth.generate_id()
     );
 
-    fetch_updates(git_project_path).await?;
+    // Fetch failures are normally external (network, authentication, or remote
+    // service). Recreate only when the local object database also fails fsck.
+    if let Err(fetch_error) = fetch_updates(git_project_path).await {
+        if let Err(local_error) = validate_local_repository(git_project_path).await {
+            return Err(RepoSyncError::recreate(ErrorArrayItem::new(
+                Errors::Git,
+                format!(
+                    "fetch failed ({}) and local repository validation failed ({})",
+                    fetch_error.err_mesg, local_error.err_mesg
+                ),
+            )));
+        }
+        return Err(RepoSyncError::retry(fetch_error));
+    }
 
     let decision: UpdateDecision = match evaluate_update_decision(auth, git_project_path).await {
         Ok(d) => Ok(d),
         Err(err) => Err(ErrorArrayItem::new(Errors::Git, err.to_string())),
-    }?;
+    }
+    .map_err(RepoSyncError::recreate)?;
 
     let local_short = truncate(decision.local_commit.clone(), 8);
     let remote_short = truncate(decision.remote_commit.clone(), 8);
@@ -75,7 +118,8 @@ pub async fn handle_existing_repo(
 
         checkout_branch(git_project_path.to_str().unwrap(), auth.branch.clone())
             .await
-            .map_err(ErrorArrayItem::from)?;
+            .map_err(ErrorArrayItem::from)
+            .map_err(RepoSyncError::recreate)?;
 
         log!(
             LogLevel::Info,
@@ -95,9 +139,8 @@ pub async fn handle_existing_repo(
     };
 
     // Only pay for submodule sync when the superproject actually moved, or on
-    // the caller-driven one-time backfill pass for repos that predate submodule
-    // support. A submodule hiccup is logged, not fatal: it shouldn't clobber an
-    // otherwise-successful superproject sync.
+    // the caller-driven one-time backfill pass for older checkouts. Submodule
+    // failures are retryable and never trigger superproject recreation.
     if decision.should_update || force_submodule_sync {
         if let Err(err) = sync_submodules(git_project_path).await {
             log!(
@@ -106,6 +149,7 @@ pub async fn handle_existing_repo(
                 auth.generate_id(),
                 err.err_mesg
             );
+            return Err(RepoSyncError::retry(err));
         }
     }
 
@@ -117,7 +161,9 @@ pub async fn handle_new_repo(
     git_project_path: &PathType,
 ) -> Result<RepoSyncOutcome, ErrorArrayItem> {
     // Clone the repository
-    let repo_url = auth.assemble_remote_url();
+    // Build the URL from the configured server/owner/repository identity. The
+    // token is supplied as an HTTP header and must never be embedded in a URL.
+    let repo_url = expected_remote_url(auth);
     clone_repo(&repo_url, git_project_path)
         .await
         .map_err(|err| ErrorArrayItem::new(Errors::Git, err.to_string()))?;
@@ -133,19 +179,313 @@ pub async fn handle_new_repo(
         .await
         .map_err(ErrorArrayItem::from)?;
 
-    if let Err(err) = sync_submodules(git_project_path).await {
+    sync_submodules(git_project_path).await.map_err(|err| {
         log!(
             LogLevel::Warn,
             "{}: submodule sync failed after clone, will retry next cycle: {}",
             auth.generate_id(),
             err.err_mesg
         );
-    }
+        err
+    })?;
 
     Ok(RepoSyncOutcome::Cloned(format!(
         "Cloned and checked out origin/{}",
         auth.branch
     )))
+}
+
+pub async fn inspect_repo_checkout(
+    auth: &GitAuth,
+    git_project_path: &PathType,
+) -> Result<RepoCheckoutState, ErrorArrayItem> {
+    let path = git_project_path.to_string();
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RepoCheckoutState::Missing)
+        }
+        Err(err) => {
+            return Err(ErrorArrayItem::new(
+                Errors::Git,
+                format!("Failed to inspect managed checkout '{}': {}", path, err),
+            ))
+        }
+    };
+
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Ok(RepoCheckoutState::Invalid {
+            reason: "managed checkout path is not a directory".to_string(),
+        });
+    }
+
+    let inspection_safe_directory = canonicalize_or_normalize(&path);
+    let top_level = git_cmd()
+        .arg("-c")
+        .arg(format!("safe.directory={}", inspection_safe_directory))
+        .arg("-C")
+        .arg(&path)
+        .arg("rev-parse")
+        .arg("--show-toplevel")
+        .output()
+        .await
+        .map_err(|err| ErrorArrayItem::new(Errors::Git, err.to_string()))?;
+
+    if !top_level.status.success() {
+        return Ok(RepoCheckoutState::Invalid {
+            reason: format!(
+                "path is not a valid Git worktree: {}",
+                String::from_utf8_lossy(&top_level.stderr).trim()
+            ),
+        });
+    }
+
+    let reported_top_level = String::from_utf8_lossy(&top_level.stdout)
+        .trim()
+        .to_string();
+    if canonicalize_or_normalize(&reported_top_level) != canonicalize_or_normalize(&path) {
+        return Ok(RepoCheckoutState::Invalid {
+            reason: format!(
+                "Git worktree root is '{}' instead of the managed path",
+                reported_top_level
+            ),
+        });
+    }
+
+    let remote_output = git_cmd()
+        .arg("-c")
+        .arg(format!("safe.directory={}", inspection_safe_directory))
+        .arg("-C")
+        .arg(&path)
+        .arg("remote")
+        .arg("get-url")
+        .arg("origin")
+        .output()
+        .await
+        .map_err(|err| ErrorArrayItem::new(Errors::Git, err.to_string()))?;
+
+    if !remote_output.status.success() {
+        return Ok(RepoCheckoutState::Invalid {
+            reason: format!(
+                "origin remote is missing or unreadable: {}",
+                String::from_utf8_lossy(&remote_output.stderr).trim()
+            ),
+        });
+    }
+
+    let actual = String::from_utf8_lossy(&remote_output.stdout)
+        .trim()
+        .to_string();
+    let expected = expected_remote_url(auth);
+    let actual_identity = canonical_remote_identity(&actual);
+    let expected_identity = canonical_remote_identity(&expected);
+
+    if actual_identity != expected_identity {
+        return Ok(RepoCheckoutState::WrongRemote {
+            expected: redact_remote_url(&expected),
+            actual: redact_remote_url(&actual),
+        });
+    }
+
+    if is_ssh_remote(&actual) && !is_ssh_remote(&expected) {
+        let actual_safe = redact_remote_url(&actual);
+        let expected_safe = redact_remote_url(&expected);
+        log!(
+            LogLevel::Warn,
+            "{}: SSH origin '{}' conflicts with git.cf; attempting HTTP rewrite to '{}'",
+            auth.generate_id(),
+            actual_safe,
+            expected_safe
+        );
+
+        let rewrite = git_cmd()
+            .arg("-c")
+            .arg(format!("safe.directory={}", inspection_safe_directory))
+            .arg("-C")
+            .arg(&path)
+            .arg("remote")
+            .arg("set-url")
+            .arg("origin")
+            .arg(&expected)
+            .output()
+            .await
+            .map_err(|err| ErrorArrayItem::new(Errors::Git, err.to_string()))?;
+
+        if rewrite.status.success() {
+            log!(
+                LogLevel::Warn,
+                "{}: SSH origin rewrite succeeded; correct the repository URL in git.cf/source configuration",
+                auth.generate_id()
+            );
+        } else {
+            let reason = format!(
+                "SSH origin rewrite failed: {}",
+                String::from_utf8_lossy(&rewrite.stderr).trim()
+            );
+            log!(LogLevel::Error, "{}: {}", auth.generate_id(), reason);
+            return Ok(RepoCheckoutState::Invalid { reason });
+        }
+    }
+
+    Ok(RepoCheckoutState::Ready {
+        remote: redact_remote_url(&expected),
+    })
+}
+
+pub async fn recreate_repo(
+    auth: &GitAuth,
+    git_project_path: &PathType,
+    reason: &str,
+) -> Result<RepoSyncOutcome, ErrorArrayItem> {
+    let configured_path = generate_git_project_path(auth).to_string();
+    let actual_path = git_project_path.to_string();
+    if configured_path != actual_path || actual_path == "/" {
+        return Err(ErrorArrayItem::new(
+            Errors::DeletingDirectory,
+            format!(
+                "Refusing to remove unmanaged path '{}' (configured path is '{}')",
+                actual_path, configured_path
+            ),
+        ));
+    }
+
+    log!(
+        LogLevel::Warn,
+        "{}: recreating managed checkout at '{}' because {}; git.cf remains the source of truth",
+        auth.generate_id(),
+        actual_path,
+        reason
+    );
+
+    match fs::symlink_metadata(&actual_path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            fs::remove_dir_all(&actual_path).map_err(|err| {
+                ErrorArrayItem::new(
+                    Errors::DeletingDirectory,
+                    format!("Failed to remove checkout '{}': {}", actual_path, err),
+                )
+            })?;
+        }
+        Ok(_) => {
+            fs::remove_file(&actual_path).map_err(|err| {
+                ErrorArrayItem::new(
+                    Errors::DeletingFile,
+                    format!("Failed to remove checkout path '{}': {}", actual_path, err),
+                )
+            })?;
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(ErrorArrayItem::new(
+                Errors::DeletingDirectory,
+                format!("Failed to inspect checkout before removal: {}", err),
+            ))
+        }
+    }
+
+    log!(
+        LogLevel::Info,
+        "{}: removed stale checkout; cloning configured repository",
+        auth.generate_id()
+    );
+
+    handle_new_repo(auth, git_project_path).await?;
+    Ok(RepoSyncOutcome::Recreated(format!(
+        "Recreated checkout from git.cf after {}",
+        reason
+    )))
+}
+
+fn expected_remote_url(auth: &GitAuth) -> String {
+    let base = match &auth.server {
+        GitServer::GitHub => "https://github.com".to_string(),
+        GitServer::GitLab => "https://gitlab.com".to_string(),
+        GitServer::Custom(url) => ssh_to_http_url(url).unwrap_or_else(|| url.to_string()),
+    };
+
+    format!(
+        "{}/{}/{}.git",
+        base.trim_end_matches('/'),
+        auth.user,
+        auth.repo
+    )
+}
+
+fn is_ssh_remote(url: &str) -> bool {
+    let trimmed = url.trim();
+    trimmed.starts_with("ssh://")
+        || (trimmed.contains('@') && !trimmed.contains("://") && trimmed.contains(':'))
+}
+
+fn ssh_to_http_url(url: &str) -> Option<String> {
+    let trimmed = url.trim().trim_end_matches('/');
+    if let Some(remainder) = trimmed.strip_prefix("ssh://") {
+        let without_user = remainder
+            .rsplit_once('@')
+            .map_or(remainder, |(_, host)| host);
+        let (host, path) = without_user.split_once('/')?;
+        return Some(format!("https://{}/{}", host, path));
+    }
+
+    if !trimmed.contains("://") {
+        let (authority, path) = trimmed.split_once(':')?;
+        let host = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        if !host.is_empty() && !path.is_empty() {
+            return Some(format!("https://{}/{}", host, path));
+        }
+    }
+
+    None
+}
+
+fn redact_remote_url(url: &str) -> String {
+    let trimmed = url.trim();
+    let Some(scheme_index) = trimmed.find("://") else {
+        return trimmed.to_string();
+    };
+    let authority_start = scheme_index + 3;
+    let authority_end = trimmed[authority_start..]
+        .find('/')
+        .map(|index| authority_start + index)
+        .unwrap_or(trimmed.len());
+    let authority = &trimmed[authority_start..authority_end];
+    let safe_authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+
+    format!(
+        "{}{}{}",
+        &trimmed[..authority_start],
+        safe_authority,
+        &trimmed[authority_end..]
+    )
+}
+
+fn canonical_remote_identity(url: &str) -> Option<String> {
+    let safe = redact_remote_url(url);
+    let trimmed = safe.trim().trim_end_matches('/');
+    let (host, path) = if let Some(scheme_index) = trimmed.find("://") {
+        let remainder = &trimmed[scheme_index + 3..];
+        remainder.split_once('/')?
+    } else {
+        let (authority, path) = trimmed.split_once(':')?;
+        let host = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        (host, path)
+    };
+
+    let normalized_path = path
+        .trim_matches('/')
+        .strip_suffix(".git")
+        .unwrap_or_else(|| path.trim_matches('/'));
+    if host.is_empty() || normalized_path.is_empty() {
+        return None;
+    }
+
+    Some(format!("{}/{}", host.to_ascii_lowercase(), normalized_path))
 }
 
 // GitHub host the extraheader credential is scoped to, so it never leaks to a
@@ -180,6 +520,8 @@ async fn sync_submodules(git_project_path: &PathType) -> Result<(), ErrorArrayIt
         ));
     }
 
+    rewrite_ssh_submodule_urls(git_project_path).await?;
+
     let header: String = github_auth_header().ok_or_else(|| {
         ErrorArrayItem::new(Errors::Git, "GitHub token not initialized".to_string())
     })?;
@@ -213,6 +555,79 @@ async fn sync_submodules(git_project_path: &PathType) -> Result<(), ErrorArrayIt
             ),
         ))
     }
+}
+
+async fn rewrite_ssh_submodule_urls(git_project_path: &PathType) -> Result<(), ErrorArrayItem> {
+    let path = git_project_path.to_string();
+    let configured_urls = git_cmd()
+        .arg("-C")
+        .arg(&path)
+        .arg("config")
+        .arg("--file")
+        .arg(".gitmodules")
+        .arg("--get-regexp")
+        .arg(r"^submodule\..*\.url$")
+        .output()
+        .await
+        .map_err(|err| ErrorArrayItem::new(Errors::Git, err.to_string()))?;
+
+    if !configured_urls.status.success() {
+        if configured_urls.status.code() == Some(1) {
+            return Ok(());
+        }
+        return Err(ErrorArrayItem::new(
+            Errors::Git,
+            format!(
+                "failed to inspect submodule URLs: {}",
+                String::from_utf8_lossy(&configured_urls.stderr).trim()
+            ),
+        ));
+    }
+
+    for line in String::from_utf8_lossy(&configured_urls.stdout).lines() {
+        let Some((key, configured_url)) = line.split_once(char::is_whitespace) else {
+            continue;
+        };
+        let configured_url = configured_url.trim();
+        let Some(http_url) = ssh_to_http_url(configured_url) else {
+            continue;
+        };
+
+        log!(
+            LogLevel::Warn,
+            "SSH submodule URL '{}' is misconfigured; attempting local HTTP rewrite to '{}'",
+            redact_remote_url(configured_url),
+            redact_remote_url(&http_url)
+        );
+
+        let rewrite = git_cmd()
+            .arg("-C")
+            .arg(&path)
+            .arg("config")
+            .arg(key)
+            .arg(&http_url)
+            .output()
+            .await
+            .map_err(|err| ErrorArrayItem::new(Errors::Git, err.to_string()))?;
+
+        if rewrite.status.success() {
+            log!(
+                LogLevel::Warn,
+                "SSH submodule URL rewrite succeeded for '{}'; update .gitmodules in the source repository",
+                key
+            );
+        } else {
+            let message = format!(
+                "SSH submodule URL rewrite failed for '{}': {}",
+                key,
+                String::from_utf8_lossy(&rewrite.stderr).trim()
+            );
+            log!(LogLevel::Error, "{}", message);
+            return Err(ErrorArrayItem::new(Errors::Git, message));
+        }
+    }
+
+    Ok(())
 }
 
 static SAFE_DIR_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
@@ -443,6 +858,30 @@ pub async fn fetch_updates(git_project_path: &PathType) -> Result<(), ErrorArray
     }
 }
 
+async fn validate_local_repository(git_project_path: &PathType) -> Result<(), ErrorArrayItem> {
+    let output = git_cmd()
+        .arg("-C")
+        .arg(git_project_path.to_string())
+        .arg("fsck")
+        .arg("--connectivity-only")
+        .arg("--no-dangling")
+        .output()
+        .await
+        .map_err(|err| ErrorArrayItem::new(Errors::Git, err.to_string()))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(ErrorArrayItem::new(
+            Errors::Git,
+            format!(
+                "git fsck failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        ))
+    }
+}
+
 async fn rev_parse_ref(
     git_project_path: &PathType,
     reference: &str,
@@ -505,6 +944,55 @@ async fn is_ancestor(
     }
 }
 
+async fn current_branch(git_project_path: &PathType) -> Result<Option<String>, std::io::Error> {
+    let output = git_cmd()
+        .arg("-C")
+        .arg(git_project_path.to_string())
+        .arg("symbolic-ref")
+        .arg("--quiet")
+        .arg("--short")
+        .arg("HEAD")
+        .output()
+        .await?;
+
+    match output.status.code() {
+        Some(0) => Ok(Some(
+            String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        )),
+        Some(1) => Ok(None),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!(
+                "git symbolic-ref failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        )),
+    }
+}
+
+async fn has_worktree_drift(git_project_path: &PathType) -> Result<bool, std::io::Error> {
+    let output = git_cmd()
+        .arg("-C")
+        .arg(git_project_path.to_string())
+        .arg("status")
+        .arg("--porcelain")
+        .arg("--untracked-files=normal")
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!(
+                "git status failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        ));
+    }
+
+    Ok(!output.stdout.is_empty())
+}
+
 // Decide whether repo should be synced to origin/<branch>.
 async fn evaluate_update_decision(
     auth: &GitAuth,
@@ -513,6 +1001,10 @@ async fn evaluate_update_decision(
     let local_commit = rev_parse_ref(git_project_path, "HEAD").await?;
     let remote_ref = format!("origin/{}", auth.branch);
     let remote_commit = rev_parse_ref(git_project_path, &remote_ref).await?;
+    let branch = current_branch(git_project_path).await?;
+    let configured_branch = auth.branch.to_string();
+    let branch_matches = branch.as_deref() == Some(configured_branch.as_str());
+    let worktree_drift = has_worktree_drift(git_project_path).await?;
 
     log!(
         LogLevel::Trace,
@@ -525,7 +1017,7 @@ async fn evaluate_update_decision(
         truncate(local_commit.clone(), 8)
     );
 
-    if local_commit == remote_commit {
+    if local_commit == remote_commit && branch_matches && !worktree_drift {
         return Ok(UpdateDecision {
             should_update: false,
             reason: "already at remote HEAD".to_string(),
@@ -534,16 +1026,32 @@ async fn evaluate_update_decision(
         });
     }
 
-    let local_is_ancestor = is_ancestor(git_project_path, &local_commit, &remote_commit).await?;
-    let remote_is_ancestor = is_ancestor(git_project_path, &remote_commit, &local_commit).await?;
+    let mut reasons = Vec::new();
+    if !branch_matches {
+        reasons.push(format!(
+            "branch drift (current: {}, configured: {})",
+            branch.unwrap_or_else(|| "detached HEAD".to_string()),
+            configured_branch
+        ));
+    }
+    if worktree_drift {
+        reasons.push("working tree drift".to_string());
+    }
+    if local_commit != remote_commit {
+        let local_is_ancestor =
+            is_ancestor(git_project_path, &local_commit, &remote_commit).await?;
+        let remote_is_ancestor =
+            is_ancestor(git_project_path, &remote_commit, &local_commit).await?;
+        reasons.push(if local_is_ancestor {
+            "remote ahead".to_string()
+        } else if remote_is_ancestor {
+            "local history drift (local ahead)".to_string()
+        } else {
+            "history diverged".to_string()
+        });
+    }
 
-    let reason = if local_is_ancestor {
-        "remote ahead".to_string()
-    } else if remote_is_ancestor {
-        "local drift detected (local ahead)".to_string()
-    } else {
-        "history diverged".to_string()
-    };
+    let reason = reasons.join(", ");
 
     Ok(UpdateDecision {
         should_update: true,
@@ -551,4 +1059,37 @@ async fn evaluate_update_decision(
         local_commit,
         remote_commit,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{canonical_remote_identity, redact_remote_url, ssh_to_http_url};
+
+    #[test]
+    fn ssh_and_https_urls_have_the_same_repository_identity() {
+        let ssh = canonical_remote_identity("git@github.com:owner/repository.git");
+        let https = canonical_remote_identity("https://github.com/owner/repository.git");
+
+        assert_eq!(ssh, https);
+    }
+
+    #[test]
+    fn rewrites_common_ssh_url_forms_to_https() {
+        assert_eq!(
+            ssh_to_http_url("git@github.com:owner/repository.git"),
+            Some("https://github.com/owner/repository.git".to_string())
+        );
+        assert_eq!(
+            ssh_to_http_url("ssh://git@github.com/owner/repository.git"),
+            Some("https://github.com/owner/repository.git".to_string())
+        );
+    }
+
+    #[test]
+    fn removes_credentials_before_remote_urls_are_logged() {
+        assert_eq!(
+            redact_remote_url("https://oauth2:secret@github.com/owner/repository.git"),
+            "https://github.com/owner/repository.git"
+        );
+    }
 }
