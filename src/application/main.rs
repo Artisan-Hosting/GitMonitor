@@ -20,7 +20,7 @@ use git::{
     cleanup_safe_directory_entries, handle_existing_repo, handle_new_repo, set_safe_directory,
     RepoSyncOutcome,
 };
-use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
+use rand::{rngs::StdRng, seq::SliceRandom, RngExt, SeedableRng};
 use signals::{sighup_watch, sigusr_watch};
 
 use auth::init_gh_token;
@@ -223,8 +223,11 @@ async fn repo_worker(
     initial_delay: u64,
 ) {
     sleep(Duration::from_secs(initial_delay)).await;
-    let mut rng: StdRng = StdRng::from_entropy();
+    let mut rng: StdRng = StdRng::from_rng(&mut rand::rng());
     let mut safe_directory_initialized = false;
+    // Forces one submodule backfill pass for repos that predate submodule
+    // support; cleared once a cycle (clone or existing-repo pass) succeeds.
+    let mut submodules_backfilled = false;
     loop {
         let git_project_path: PathType = generate_git_project_path(&git_item);
         let result: Result<RepoSyncOutcome, ErrorArrayItem> = if git_project_path.exists() {
@@ -234,7 +237,12 @@ async fn repo_worker(
                     Err(err) => log!(LogLevel::Error, "{}", err.err_mesg),
                 }
             }
-            handle_existing_repo(&git_item, &git_project_path).await
+            let result =
+                handle_existing_repo(&git_item, &git_project_path, !submodules_backfilled).await;
+            if result.is_ok() {
+                submodules_backfilled = true;
+            }
+            result
         } else {
             log!(
                 LogLevel::Warn,
@@ -244,6 +252,8 @@ async fn repo_worker(
             let result = handle_new_repo(&git_item, &git_project_path).await;
             if result.is_ok() {
                 safe_directory_initialized = true;
+                // handle_new_repo already ran an initial submodule sync.
+                submodules_backfilled = true;
             }
             result
         };
@@ -269,7 +279,7 @@ async fn repo_worker(
         }
         drop(s);
 
-        let wait = rng.gen_range(25..35);
+        let wait = rng.random_range(25..35);
         sleep(Duration::from_secs(wait)).await;
     }
 }
@@ -282,13 +292,13 @@ async fn repo_worker(
 //     monitor: Option<ResourceMonitorLock>,
 // ) {
 //     let Some(items) = auth_items() else { return };
-//     let mut rng: StdRng = StdRng::from_entropy();
+//     let mut rng: StdRng = StdRng::from_rng(&mut rand::rng());
 //     let mut indices: Vec<usize> = (0..items.len()).collect();
 //     indices.shuffle(&mut rng);
 
 //     for idx in indices {
 //         let git_item = items[idx].clone();
-//         let delay = rng.gen_range(0..5);
+//         let delay = rng.random_range(0..5);
 //         let st = state.clone();
 //         let path = state_path.clone();
 //         let mon = monitor.as_ref().map(|m| m.clone());
@@ -311,7 +321,7 @@ async fn spawn_git_workers(
     monitor: Option<ResourceMonitorLock>,
 ) {
     let mut credentials_shuffled = git_credentials.clone();
-    let mut rng: StdRng = StdRng::from_entropy();
+    let mut rng: StdRng = StdRng::from_rng(&mut rand::rng());
     credentials_shuffled.auth_items.shuffle(&mut rng);
 
     for git_item in credentials_shuffled.auth_items {
@@ -320,7 +330,7 @@ async fn spawn_git_workers(
             "Deploying working thread for: {}",
             generate_git_project_id(&git_item)
         );
-        let delay = rng.gen_range(0..5);
+        let delay = rng.random_range(0..5);
         let st = state.clone();
         let path = state_path.clone();
         let mon = monitor.as_ref().map(|m| m.clone());

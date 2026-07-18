@@ -45,6 +45,7 @@ struct UpdateDecision {
 pub async fn handle_existing_repo(
     auth: &GitAuth,
     git_project_path: &PathType,
+    force_submodule_sync: bool,
 ) -> Result<RepoSyncOutcome, ErrorArrayItem> {
     log!(
         LogLevel::Trace,
@@ -62,7 +63,7 @@ pub async fn handle_existing_repo(
     let local_short = truncate(decision.local_commit.clone(), 8);
     let remote_short = truncate(decision.remote_commit.clone(), 8);
 
-    if decision.should_update {
+    let outcome = if decision.should_update {
         log!(
             LogLevel::Info,
             "{} requires sync (reason: {}, local: {}, remote: {})",
@@ -81,17 +82,34 @@ pub async fn handle_existing_repo(
             "{} synced, runner should rebuild this shortly.",
             auth.generate_id()
         );
-        Ok(RepoSyncOutcome::Updated(format!(
+        RepoSyncOutcome::Updated(format!(
             "Synced to origin/{} ({}) because {} (local was {})",
             auth.branch, remote_short, decision.reason, local_short
-        )))
+        ))
     } else {
         log!(LogLevel::Info, "{}: Up to date !", auth.generate_id());
-        Ok(RepoSyncOutcome::NoChange(format!(
+        RepoSyncOutcome::NoChange(format!(
             "No sync needed ({} == origin/{})",
             local_short, auth.branch
-        )))
+        ))
+    };
+
+    // Only pay for submodule sync when the superproject actually moved, or on
+    // the caller-driven one-time backfill pass for repos that predate submodule
+    // support. A submodule hiccup is logged, not fatal: it shouldn't clobber an
+    // otherwise-successful superproject sync.
+    if decision.should_update || force_submodule_sync {
+        if let Err(err) = sync_submodules(git_project_path).await {
+            log!(
+                LogLevel::Warn,
+                "{}: submodule sync failed, will retry next cycle: {}",
+                auth.generate_id(),
+                err.err_mesg
+            );
+        }
     }
+
+    Ok(outcome)
 }
 
 pub async fn handle_new_repo(
@@ -115,10 +133,86 @@ pub async fn handle_new_repo(
         .await
         .map_err(ErrorArrayItem::from)?;
 
+    if let Err(err) = sync_submodules(git_project_path).await {
+        log!(
+            LogLevel::Warn,
+            "{}: submodule sync failed after clone, will retry next cycle: {}",
+            auth.generate_id(),
+            err.err_mesg
+        );
+    }
+
     Ok(RepoSyncOutcome::Cloned(format!(
         "Cloned and checked out origin/{}",
         auth.branch
     )))
+}
+
+// GitHub host the extraheader credential is scoped to, so it never leaks to a
+// third-party host referenced by .gitmodules.
+const GITHUB_REMOTE_PREFIX: &str = "https://github.com/";
+
+// Initialize and update submodules (if any) to match the superproject's recorded commits.
+async fn sync_submodules(git_project_path: &PathType) -> Result<(), ErrorArrayItem> {
+    if !git_project_path.join(".gitmodules").exists() {
+        return Ok(());
+    }
+
+    let path = git_project_path.to_string();
+
+    log!(LogLevel::Debug, "Syncing submodules for {}", path);
+
+    // Pick up any URL changes recorded in .gitmodules before updating.
+    let sync_status = git_cmd()
+        .arg("-C")
+        .arg(&path)
+        .arg("submodule")
+        .arg("sync")
+        .arg("--recursive")
+        .status()
+        .await
+        .map_err(|e| ErrorArrayItem::new(Errors::Git, e.to_string()))?;
+
+    if !sync_status.success() {
+        return Err(ErrorArrayItem::new(
+            Errors::Git,
+            format!("git submodule sync failed for {}", path),
+        ));
+    }
+
+    let header: String = github_auth_header().ok_or_else(|| {
+        ErrorArrayItem::new(Errors::Git, "GitHub token not initialized".to_string())
+    })?;
+
+    let output = git_cmd()
+        .arg("-C")
+        .arg(&path)
+        .arg("-c")
+        .arg(format!(
+            "http.{}.extraheader={}",
+            GITHUB_REMOTE_PREFIX, header
+        ))
+        .arg("submodule")
+        .arg("update")
+        .arg("--init")
+        .arg("--recursive")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .await
+        .map_err(|e| ErrorArrayItem::new(Errors::Git, e.to_string()))?;
+
+    if output.status.success() {
+        log!(LogLevel::Debug, "Submodules synced for {}", path);
+        Ok(())
+    } else {
+        Err(ErrorArrayItem::new(
+            Errors::Git,
+            format!(
+                "git submodule update failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        ))
+    }
 }
 
 static SAFE_DIR_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));

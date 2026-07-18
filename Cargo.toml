@@ -4,19 +4,19 @@ version = "2.5.0"
 edition = "2021"
 
 [dependencies]
-#artisan_middleware = "5.6.0"
+#artisan_middleware = "5.6.3"
 artisan_middleware = {path = "/opt/artisan/lib/artisan_lib"}
-config = "0.14.0"
-serde = "1.0.210"
+config = "0.15.25"
+serde = "1.0.228"
 serde_json = "1.0.128"
-toml = "0.8.19"
-tokio = "1.40.0"
+toml = "1.1.3+spec-1.1.0"
+tokio = "1.53.0"
 rng = "0.1.0"
-rand = "0.8.5"
-colored = "2.1.0"
+rand = "0.10.2"
+colored = "3.1.1"
 signals = "0.0.5"
-signal-hook = "0.3.17"
-once_cell = "1.20.2"
+signal-hook = "0.4.4"
+once_cell = "1.21.4"
 base64 = "0.22.1"
 
 [[bin]]
