@@ -1,5 +1,5 @@
 use artisan_middleware::{
-    cli::{get_user_input, get_user_selection},
+    cli::{get_user_input, get_user_selection, get_yes_no},
     config::AppConfig,
     dusa_collection_utils::{
         core::{
@@ -16,6 +16,7 @@ use std::{
     collections::HashSet,
     fs, io,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 const AIS_REPO_ROOT: &str = "/var/www/ais";
@@ -129,6 +130,164 @@ fn remove_stale_checkout(path: &Path) -> io::Result<()> {
     }
 }
 
+enum CheckoutAudit {
+    Ready,
+    Missing,
+    Invalid(String),
+}
+
+fn git_command(git_project_path: &Path) -> Command {
+    let mut command = Command::new("git");
+    command
+        .arg("-c")
+        .arg(format!("safe.directory={}", git_project_path.display()))
+        .arg("-C")
+        .arg(git_project_path);
+    command
+}
+
+fn inspect_checkout(git_project_path: &Path) -> CheckoutAudit {
+    let metadata = match fs::symlink_metadata(git_project_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return CheckoutAudit::Missing,
+        Err(err) => return CheckoutAudit::Invalid(err.to_string()),
+    };
+
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return CheckoutAudit::Invalid("checkout path is not a directory".to_string());
+    }
+
+    let output = match git_command(git_project_path)
+        .arg("rev-parse")
+        .arg("--show-toplevel")
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) => return CheckoutAudit::Invalid(err.to_string()),
+    };
+
+    if !output.status.success() {
+        return CheckoutAudit::Invalid(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+
+    let reported_root = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    let expected_root =
+        fs::canonicalize(git_project_path).unwrap_or_else(|_| git_project_path.to_path_buf());
+    let reported_root = fs::canonicalize(&reported_root).unwrap_or(reported_root);
+    if reported_root != expected_root {
+        return CheckoutAudit::Invalid(format!(
+            "Git root '{}' does not match checkout path",
+            reported_root.display()
+        ));
+    }
+
+    CheckoutAudit::Ready
+}
+
+fn run_git_step(git_project_path: &Path, args: &[&str], step: &str) -> Result<(), String> {
+    let status = git_command(git_project_path)
+        .args(args)
+        .status()
+        .map_err(|err| format!("{} failed to start: {}", step, err))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{} exited with {}", step, status))
+    }
+}
+
+fn force_sync_checkout(auth: &GitAuth, git_project_path: &Path) -> Result<(), String> {
+    let branch = auth.branch.to_string();
+    let remote_branch = format!("origin/{}", branch);
+
+    run_git_step(git_project_path, &["fetch", "origin"], "git fetch")?;
+    run_git_step(
+        git_project_path,
+        &["checkout", "-B", &branch, &remote_branch],
+        "git checkout",
+    )?;
+    run_git_step(
+        git_project_path,
+        &["reset", "--hard", &remote_branch],
+        "git reset",
+    )?;
+    run_git_step(git_project_path, &["clean", "-ffd"], "git clean")?;
+    Ok(())
+}
+
+fn audit_configured_checkouts(git_credentials: &GitCredentials, force_sync: bool) -> bool {
+    let mut ready = 0_usize;
+    let mut missing = 0_usize;
+    let mut invalid = 0_usize;
+    let mut sync_failed = 0_usize;
+
+    for auth in &git_credentials.auth_items {
+        let git_project_path = PathBuf::from(generate_git_project_path(auth).to_string());
+        let repo_id = auth.generate_id();
+
+        match inspect_checkout(&git_project_path) {
+            CheckoutAudit::Ready if force_sync => {
+                log!(
+                    LogLevel::Info,
+                    "{}: checkout ready; force syncing {} to origin/{}",
+                    repo_id,
+                    git_project_path.display(),
+                    auth.branch
+                );
+                match force_sync_checkout(auth, &git_project_path) {
+                    Ok(()) => {
+                        ready += 1;
+                        log!(LogLevel::Info, "{}: force sync complete", repo_id);
+                    }
+                    Err(err) => {
+                        sync_failed += 1;
+                        log!(LogLevel::Error, "{}: force sync failed: {}", repo_id, err);
+                    }
+                }
+            }
+            CheckoutAudit::Ready => {
+                ready += 1;
+                log!(
+                    LogLevel::Info,
+                    "{}: checkout ready at {}",
+                    repo_id,
+                    git_project_path.display()
+                );
+            }
+            CheckoutAudit::Missing => {
+                missing += 1;
+                log!(
+                    LogLevel::Warn,
+                    "{}: checkout missing at {}",
+                    repo_id,
+                    git_project_path.display()
+                );
+            }
+            CheckoutAudit::Invalid(reason) => {
+                invalid += 1;
+                log!(
+                    LogLevel::Error,
+                    "{}: checkout invalid at {}: {}",
+                    repo_id,
+                    git_project_path.display(),
+                    reason
+                );
+            }
+        }
+    }
+
+    log!(
+        LogLevel::Info,
+        "Checkout audit complete: {} ready, {} missing, {} invalid, {} sync failures",
+        ready,
+        missing,
+        invalid,
+        sync_failed
+    );
+    missing == 0 && invalid == 0 && sync_failed == 0
+}
+
 #[tokio::main]
 async fn main() {
     // load the data
@@ -156,7 +315,8 @@ async fn main() {
     println!("2. Create new git credential file");
     println!("3. Append data to git credential file");
     println!("4. Remove data from git credential file");
-    println!("5. Clean stale repository checkout");
+    println!("5. Clean all stale repository checkouts");
+    println!("6. Audit configured repository checkouts");
 
     loop {
         let choice: String = get_user_input("Enter number of desired action: ").to_string();
@@ -246,6 +406,11 @@ async fn main() {
             "4" => {
                 log!(LogLevel::Info, "Deleting entries from git credentials");
 
+                if git_credentials.auth_items.is_empty() {
+                    log!(LogLevel::Info, "No git credentials are configured");
+                    std::process::exit(0)
+                }
+
                 let mut options: Vec<String> = vec![];
 
                 for item in git_credentials.clone().to_vec() {
@@ -253,17 +418,54 @@ async fn main() {
                     options.push(entry);
                 }
 
-                let mut num = get_user_selection(&options);
-                num -= 1; // to align with the 0 starting index
+                let num = get_user_selection(&options) - 1;
+                let selected_auth = git_credentials.auth_items[num].clone();
+                let checkout_id = selected_auth.generate_id();
+                if !get_yes_no(&format!(
+                    "Remove {}-{}@{} ({}) from git.cf",
+                    selected_auth.user, selected_auth.repo, selected_auth.branch, checkout_id
+                )) {
+                    log!(LogLevel::Info, "Credential removal cancelled");
+                    std::process::exit(0)
+                }
 
                 let new_credentials = git_credentials.delete_item(num).await.unwrap();
 
                 let git_path = git_credentials_path(&config);
 
-                match new_credentials.save(&git_path.clone()).await {
-                    Ok(_) => log!(LogLevel::Info, "Git credentials saved @: {}", git_path),
-                    Err(err) => log!(LogLevel::Error, "{}", err),
+                if let Err(err) = new_credentials.save(&git_path).await {
+                    log!(LogLevel::Error, "{}", err);
+                    std::process::exit(1)
                 }
+                log!(LogLevel::Info, "Git credentials saved @: {}", git_path);
+
+                let checkout_path =
+                    PathBuf::from(generate_git_project_path(&selected_auth).to_string());
+                match remove_stale_checkout(&checkout_path) {
+                    Ok(()) => log!(
+                        LogLevel::Info,
+                        "Removed checkout '{}' after git.cf entry removal",
+                        checkout_path.display()
+                    ),
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => log!(
+                        LogLevel::Info,
+                        "Checkout '{}' was already absent",
+                        checkout_path.display()
+                    ),
+                    Err(err) => {
+                        log!(
+                            LogLevel::Error,
+                            "Credential was removed, but checkout cleanup failed for '{}': {}",
+                            checkout_path.display(),
+                            err
+                        );
+                        std::process::exit(1)
+                    }
+                }
+                log!(
+                    LogLevel::Warn,
+                    "Restart GitMonitor if it is running so the removed repository worker is retired"
+                );
 
                 std::process::exit(0)
             }
@@ -298,55 +500,64 @@ async fn main() {
                     std::process::exit(0)
                 }
 
-                println!(
-                    "GitMonitor does not stop workers when git.cf changes. Restart or stop ais_gitmon before cleanup so an old worker cannot recreate a removed checkout."
-                );
-                println!("Select one stale checkout to remove:");
-                let options: Vec<String> = candidates
-                    .iter()
-                    .map(|path| path.display().to_string())
-                    .collect();
-                let selection = get_user_selection(&options);
-                if selection == 0 || selection > candidates.len() {
-                    log!(LogLevel::Error, "Invalid cleanup selection");
-                    std::process::exit(1)
-                }
-
-                let selected = &candidates[selection - 1];
-                let checkout_id = selected
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("");
-                let confirmation: String = get_user_input(&format!(
-                    "Type '{}' to remove {}: ",
-                    checkout_id,
-                    selected.display()
-                ))
-                .to_string();
-
-                if confirmation.trim() != checkout_id {
-                    log!(LogLevel::Info, "Cleanup cancelled");
-                    std::process::exit(0)
-                }
-
-                match remove_stale_checkout(selected) {
-                    Ok(()) => log!(
-                        LogLevel::Info,
-                        "Removed stale checkout '{}' (manual cleanup is not recoverable)",
-                        selected.display()
-                    ),
-                    Err(err) => {
-                        log!(
-                            LogLevel::Error,
-                            "Failed to remove '{}': {}",
-                            selected.display(),
-                            err
-                        );
-                        std::process::exit(1)
+                let mut removed = 0_usize;
+                let mut failed = 0_usize;
+                for candidate in candidates {
+                    match remove_stale_checkout(&candidate) {
+                        Ok(()) => {
+                            removed += 1;
+                            log!(
+                                LogLevel::Info,
+                                "Removed stale checkout '{}'",
+                                candidate.display()
+                            );
+                        }
+                        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                        Err(err) => {
+                            failed += 1;
+                            log!(
+                                LogLevel::Error,
+                                "Failed to remove '{}': {}",
+                                candidate.display(),
+                                err
+                            );
+                        }
                     }
                 }
 
+                log!(
+                    LogLevel::Info,
+                    "Stale checkout cleanup complete: {} removed, {} failed",
+                    removed,
+                    failed
+                );
+                if failed > 0 {
+                    std::process::exit(1)
+                }
                 std::process::exit(0)
+            }
+            "6" => {
+                if !credentials_loaded {
+                    log!(
+                        LogLevel::Error,
+                        "Audit refused because the configured git credential file was not loaded"
+                    );
+                    std::process::exit(1)
+                }
+
+                let force_sync =
+                    get_yes_no("Force sync valid checkouts to their configured origin branches");
+                if audit_configured_checkouts(&git_credentials, force_sync) {
+                    std::process::exit(0)
+                } else {
+                    if !force_sync {
+                        log!(
+                            LogLevel::Warn,
+                            "Missing repositories will be cloned by the monitor on its next reconciliation cycle"
+                        );
+                    }
+                    std::process::exit(2)
+                }
             }
             "or" => {
                 set_log_level(LogLevel::Debug);
@@ -357,7 +568,7 @@ async fn main() {
                 set_log_level(config.log_level);
             }
             _ => {
-                println!("Invalid choice. Please enter 1, 2, 3, 4 or 5.");
+                println!("Invalid choice. Please enter 1, 2, 3, 4, 5 or 6.");
             }
         }
     }
@@ -365,7 +576,8 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::is_managed_checkout_name;
+    use super::{inspect_checkout, is_managed_checkout_name, remove_stale_checkout, CheckoutAudit};
+    use std::{io, path::Path};
 
     #[test]
     fn recognizes_only_gitmonitor_checkout_ids() {
@@ -375,5 +587,17 @@ mod tests {
         assert!(!is_managed_checkout_name("a1b2c3d45"));
         assert!(!is_managed_checkout_name("repository"));
         assert!(!is_managed_checkout_name("a1b2c3g4"));
+    }
+
+    #[test]
+    fn reports_an_absent_checkout_as_missing() {
+        let path = Path::new("/tmp/ais_gitmon_checkout_that_does_not_exist");
+        assert!(matches!(inspect_checkout(path), CheckoutAudit::Missing));
+    }
+
+    #[test]
+    fn cleanup_refuses_paths_outside_the_managed_root() {
+        let err = remove_stale_checkout(Path::new("/tmp/a1b2c3d4")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 }
