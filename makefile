@@ -2,7 +2,7 @@
 APP_NAME = ais_gitmon
 SERVICE_FILE = /etc/systemd/system/$(APP_NAME).service
 BIN_DIR = /opt/artisan/bin/
-CONFIG_DIR = /etc/$(APP_NAME)
+CONFIG_DIR = /opt/artisan/etc/$(APP_NAME)
 
 # Build binaries
 build:
@@ -11,18 +11,25 @@ build:
 # Install binaries and config files
 install: build
 	@echo "Installing binaries..."
+	@ais stop ais_gitmon
+
 	install -m 0755 target/release/$(APP_NAME) $(BIN_DIR)
 	install -m 0755 target/release/cli_credential $(BIN_DIR)
+	@ln -sv $(BIN_DIR)/cli_credential /usr/bin/gitcf
 
 	@echo "Installing configuration files..."
 	install -d $(CONFIG_DIR)
-	install -m 0644 Config.toml Overrides.toml $(CONFIG_DIR)
+	@for f in Config.toml Overrides.toml; do \
+		if [ ! -f "$$f" ]; then \
+			echo "  $$f not present in source tree, skipping"; \
+		elif [ -e "$(CONFIG_DIR)/$$f" ]; then \
+			echo "  $(CONFIG_DIR)/$$f already exists, leaving it in place"; \
+		else \
+			install -m 0644 "$$f" "$(CONFIG_DIR)/$$f"; \
+		fi; \
+	done
 
-	@echo "Installing systemd service file..."
-	install -m 0644 $(APP_NAME).service $(SERVICE_FILE)
-	systemctl daemon-reload
-	systemctl enable $(APP_NAME)
-	systemctl start $(APP_NAME)
+	@ais start ais_gitmon 
 
 # Uninstall binaries, config files, and service
 uninstall:
