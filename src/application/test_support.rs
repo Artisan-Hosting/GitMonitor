@@ -40,7 +40,7 @@ impl Sandbox {
     /// Creates a hermetic sandbox and points `AIS_GITMON_CONFIG_DIR` at it.
     pub fn new() -> Self {
         let dir = TempDir::new().expect("create sandbox temp dir");
-        std::env::set_var("AIS_GITMON_CONFIG_DIR", dir.path().join("gitconfig-root"));
+        unsafe { std::env::set_var("AIS_GITMON_CONFIG_DIR", dir.path().join("gitconfig-root")) };
 
         let token_file = dir.path().join("token.toml");
         fs::write(&token_file, format!("token = \"{}\"\n", TEST_TOKEN))
