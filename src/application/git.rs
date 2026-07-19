@@ -109,6 +109,12 @@ pub async fn handle_existing_repo(
     // Fetch failures are normally external (network, authentication, or remote
     // service). Recreate only when the local object database also fails fsck.
     if let Err(fetch_error) = fetch_updates(git_project_path).await {
+        // Worktree drift cleanup below is gated on a successful fetch, so a
+        // stretch of network/auth failures would otherwise leave local edits
+        // sitting on disk indefinitely. Repair drift here too, best-effort,
+        // so it doesn't wait on connectivity.
+        reset_worktree_drift_if_present(auth, git_project_path).await;
+
         if let Err(local_error) = validate_local_repository(git_project_path).await {
             return Err(RepoSyncError::recreate(ErrorArrayItem::new(
                 Errors::Git,
@@ -1032,6 +1038,86 @@ async fn has_worktree_drift(git_project_path: &PathType) -> Result<bool, std::io
     Ok(!output.stdout.is_empty())
 }
 
+// Reverts uncommitted local changes (modified tracked files and untracked
+// files/dirs) back to HEAD, without touching which commit HEAD points at.
+// Used when we can't reach the remote and so can't sync to origin, but still
+// don't want a dirty checkout lingering on disk.
+async fn reset_worktree_drift(git_project_path: &PathType) -> Result<(), ErrorArrayItem> {
+    let reset = git_cmd()
+        .arg("-C")
+        .arg(git_project_path.to_string())
+        .arg("reset")
+        .arg("--hard")
+        .arg("HEAD")
+        .output()
+        .await
+        .map_err(|err| ErrorArrayItem::new(Errors::Git, err.to_string()))?;
+
+    if !reset.status.success() {
+        return Err(ErrorArrayItem::new(
+            Errors::Git,
+            format!(
+                "git reset --hard HEAD failed: {}",
+                String::from_utf8_lossy(&reset.stderr)
+            ),
+        ));
+    }
+
+    let clean = git_cmd()
+        .arg("-C")
+        .arg(git_project_path.to_string())
+        .arg("clean")
+        .arg("-ffd")
+        .output()
+        .await
+        .map_err(|err| ErrorArrayItem::new(Errors::Git, err.to_string()))?;
+
+    if !clean.status.success() {
+        return Err(ErrorArrayItem::new(
+            Errors::Git,
+            format!(
+                "git clean -ffd failed: {}",
+                String::from_utf8_lossy(&clean.stderr)
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+// Best-effort: checks for local file drift and reverts it, logging rather
+// than failing the caller's cycle either way. Called from the fetch-failure
+// path where a hard failure here shouldn't override the underlying fetch
+// error the caller reports.
+async fn reset_worktree_drift_if_present(auth: &GitAuth, git_project_path: &PathType) {
+    match has_worktree_drift(git_project_path).await {
+        Ok(true) => {
+            log!(
+                LogLevel::Warn,
+                "{}: local file changes detected while fetch is unavailable, resetting worktree to HEAD",
+                auth.generate_id()
+            );
+            if let Err(err) = reset_worktree_drift(git_project_path).await {
+                log!(
+                    LogLevel::Error,
+                    "{}: failed to reset worktree drift: {}",
+                    auth.generate_id(),
+                    err.err_mesg
+                );
+            }
+        }
+        Ok(false) => {}
+        Err(err) => {
+            log!(
+                LogLevel::Warn,
+                "{}: failed to check worktree drift: {}",
+                auth.generate_id(),
+                err
+            );
+        }
+    }
+}
+
 // Decide whether repo should be synced to origin/<branch>.
 async fn evaluate_update_decision(
     auth: &GitAuth,
@@ -1479,6 +1565,51 @@ mod integration_tests {
         assert_eq!(
             contents, "a",
             "checkout should have been reset to upstream content"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn handle_existing_repo_resets_worktree_drift_even_when_fetch_fails() {
+        let sandbox = Sandbox::new();
+        let bare = sandbox
+            .seed_origin("acme", "widgets", "main", &[("a.txt", "a")])
+            .await;
+        let auth = sandbox.git_auth("acme", "widgets", "main");
+        let checkout = sandbox.checkout_path("widgets");
+        sandbox.clone_checkout(&bare, "main", &checkout).await;
+
+        std::fs::write(checkout_dir(&checkout).join("a.txt"), "modified locally")
+            .expect("simulate local drift");
+        std::fs::write(checkout_dir(&checkout).join("untracked.txt"), "stray")
+            .expect("simulate untracked drift");
+
+        // Point origin somewhere unreachable so fetch_updates fails, mimicking
+        // a network/token outage. Local drift should still get reverted.
+        run_git(
+            &[],
+            &checkout_dir(&checkout),
+            &["remote", "set-url", "origin", "file:///does/not/exist.git"],
+        )
+        .await;
+
+        let err = match handle_existing_repo(&auth, &checkout, false).await {
+            Ok(_) => panic!("fetch should fail against an unreachable remote"),
+            Err(err) => err,
+        };
+        assert!(
+            !err.recreate_checkout,
+            "a broken remote shouldn't trigger a full recreate, just a retry"
+        );
+
+        let contents = std::fs::read_to_string(checkout_dir(&checkout).join("a.txt")).unwrap();
+        assert_eq!(
+            contents, "a",
+            "local edits should be reverted even though fetch failed"
+        );
+        assert!(
+            !checkout_dir(&checkout).join("untracked.txt").exists(),
+            "untracked files should be cleaned even though fetch failed"
         );
     }
 
