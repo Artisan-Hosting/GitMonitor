@@ -31,6 +31,26 @@ install: build
 
 	@ais start ais_gitmon 
 
+# Install binaries and config files
+install_safe: build
+	@echo "Installing binaries..."
+
+	install -m 0755 target/release/$(APP_NAME) $(BIN_DIR)
+	install -m 0755 target/release/cli_credential $(BIN_DIR)
+	@ln -sv $(BIN_DIR)/cli_credential /usr/bin/gitcf
+
+	@echo "Installing configuration files..."
+	install -d $(CONFIG_DIR)
+	@for f in Config.toml Overrides.toml; do \
+		if [ ! -f "$$f" ]; then \
+			echo "  $$f not present in source tree, skipping"; \
+		elif [ -e "$(CONFIG_DIR)/$$f" ]; then \
+			echo "  $(CONFIG_DIR)/$$f already exists, leaving it in place"; \
+		else \
+			install -m 0644 "$$f" "$(CONFIG_DIR)/$$f"; \
+		fi; \
+	done
+
 # Uninstall binaries, config files, and service
 uninstall:
 	@echo "Stopping and removing systemd service..."
