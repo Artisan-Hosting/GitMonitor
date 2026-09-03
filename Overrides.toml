@@ -7,6 +7,3 @@ log_level = "Info"
 default_server = "GitHub"
 credentials_file = "/tmp/git.recs"
 token_file = "/tmp/github.token"
-
-[aggregator]
-socket_path = "/tmp/test.sock"

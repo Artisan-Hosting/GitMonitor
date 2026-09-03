@@ -138,7 +138,21 @@ pub fn get_git_token_file() -> Option<String> {
         }
     };
 
-    let parsed = match contents.parse::<toml::Value>() {
+    parse_token_file_path(&contents)
+}
+
+// Split out from `get_git_token_file` so the parsing logic can be
+// regression-tested without touching the process's CWD or the filesystem.
+fn parse_token_file_path(contents: &str) -> Option<String> {
+    // `contents.parse::<toml::Value>()` uses `toml::Value`'s own `FromStr`,
+    // which only accepts a single bare value (a string, a number, an inline
+    // table, ...), not a full multi-line document -- a real Overrides.toml
+    // (which starts with a `#` comment) fails to parse there and this
+    // function would incorrectly report no token_file configured, silently
+    // falling back to `gh auth token`. `toml::from_str` parses a whole
+    // document, which is what Overrides.toml actually is. See the same
+    // footgun documented in `auth::parse_token`.
+    let parsed = match toml::from_str::<toml::Value>(contents) {
         Ok(parsed) => parsed,
         Err(err) => {
             log!(
@@ -155,6 +169,40 @@ pub fn get_git_token_file() -> Option<String> {
         .and_then(|git| git.get("token_file"))
         .and_then(toml::Value::as_str)
         .map(str::to_string)
+}
+
+#[cfg(test)]
+mod token_file_path_tests {
+    use super::parse_token_file_path;
+
+    #[test]
+    fn parses_token_file_with_leading_comment() {
+        let contents = "# Overrides for the default config from the lib\n\n\
+             debug_mode = true\n\
+             log_level = \"Info\"\n\
+             \n\
+             [git]\n\
+             default_server = \"GitHub\"\n\
+             credentials_file = \"/tmp/git.recs\"\n\
+             token_file = \"/tmp/github.token\"\n";
+
+        assert_eq!(
+            parse_token_file_path(contents),
+            Some("/tmp/github.token".to_string())
+        );
+    }
+
+    #[test]
+    fn returns_none_when_git_section_missing_token_file() {
+        let contents = "[git]\ndefault_server = \"GitHub\"\n";
+        assert_eq!(parse_token_file_path(contents), None);
+    }
+
+    #[test]
+    fn returns_none_on_malformed_toml() {
+        let contents = "# comment\n[git\ntoken_file = \"/tmp/github.token\"\n";
+        assert_eq!(parse_token_file_path(contents), None);
+    }
 }
 
 pub async fn update_state_wrapper(
