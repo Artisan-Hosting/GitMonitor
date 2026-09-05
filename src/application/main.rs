@@ -301,6 +301,12 @@ struct WorkerCycleState {
     // support; cleared once a cycle (clone or existing-repo pass) succeeds.
     submodules_backfilled: bool,
     consecutive_failures: u32,
+    // Unix timestamp of the last full checkout-ownership sweep (recursive
+    // chown). Zero forces one on the first cycle; `handle_existing_repo`
+    // otherwise only re-sweeps when the checkout changed or the periodic
+    // safety-net interval has elapsed, since a full chown walk every cycle
+    // is expensive across many repos.
+    last_ownership_check: u64,
 }
 
 impl Default for WorkerCycleState {
@@ -309,6 +315,7 @@ impl Default for WorkerCycleState {
             safe_directory_initialized: false,
             submodules_backfilled: false,
             consecutive_failures: 0,
+            last_ownership_check: 0,
         }
     }
 }
@@ -409,6 +416,7 @@ async fn run_worker_cycle(
                 git_item,
                 git_project_path,
                 !cycle_state.submodules_backfilled,
+                &mut cycle_state.last_ownership_check,
             )
             .await
             {
@@ -443,6 +451,10 @@ async fn run_worker_cycle(
                 format!("{} at '{}': {}", repo_id, git_project_path, err.err_mesg),
             );
             log_error(&mut s, contextual_error, state_path).await;
+            // log_error() calls the library's raw, uncapped update_state();
+            // truncate here too so a run of failures across many repo
+            // workers can't grow error_log unbounded between heartbeats.
+            config::truncate_error_log(&mut s);
         }
         Ok(outcome) => {
             match outcome {

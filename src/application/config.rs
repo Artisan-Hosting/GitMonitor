@@ -14,6 +14,21 @@ use artisan_middleware::version::{aml_version, str_to_version};
 use std::fs;
 
 const DEFAULT_APP_CONFIG_DIR: &str = "/etc/ais_gitmon";
+const ERROR_LOG_MAX_SIZE: usize = 5;
+
+/// Caps `state.error_log` in place. The library's own `log_error()` pushes
+/// to this vec via a raw, uncapped `update_state()`, so a run of consecutive
+/// failures across many repo workers can otherwise grow it unbounded between
+/// [`update_state_wrapper`] heartbeats.
+pub fn truncate_error_log(state: &mut AppState) {
+    if state.error_log.len() > ERROR_LOG_MAX_SIZE {
+        state.data = format!(
+            "The error log has a legnth of {}. Truncating...",
+            state.error_log.len()
+        );
+        state.error_log.truncate(ERROR_LOG_MAX_SIZE);
+    }
+}
 
 /// Root directory for this app's git config/state. Overridable via
 /// `AIS_GITMON_CONFIG_DIR` so tests can run against a hermetic temp
@@ -225,14 +240,7 @@ pub async fn update_state_wrapper(
         }
     }
 
-    let error_array_max_size = 5;
-    if state.error_log.len().gt(&error_array_max_size) {
-        state.data = format!(
-            "The error log has a legnth of {}. Truncating...",
-            state.error_log.len()
-        );
-        state.error_log.truncate(error_array_max_size);
-    }
+    truncate_error_log(state);
 
     update_state(state, &path, metrics).await;
 }

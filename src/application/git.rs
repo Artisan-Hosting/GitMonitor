@@ -18,7 +18,12 @@ use artisan_middleware::{
 // };
 // use dusa_collection_utils::{functions::truncate, log};
 use once_cell::sync::Lazy;
-use std::{collections::HashSet, fs, path::Path};
+use std::{
+    collections::HashSet,
+    fs,
+    path::Path,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
@@ -70,6 +75,20 @@ struct UpdateDecision {
     remote_commit: String,
 }
 
+// Full ownership reassertion (recursive chown of the checkout) is only cheap
+// relative to how often it runs. On a NoChange cycle nothing in the checkout
+// moved, so we skip it there and instead fall back to a periodic sweep, long
+// enough to keep steady-state I/O low but short enough to still self-heal
+// out-of-band ownership drift within a reasonable window.
+const OWNERSHIP_SWEEP_INTERVAL_SECS: u64 = 15 * 60;
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 // Recursively chowns a managed checkout back to www-data. Called after every
 // action that touches a checkout (clone, fetch/checkout, force-resync) so
 // ownership drift introduced by any other process gets corrected within one
@@ -99,6 +118,7 @@ pub async fn handle_existing_repo(
     auth: &GitAuth,
     git_project_path: &PathType,
     force_submodule_sync: bool,
+    last_ownership_check: &mut u64,
 ) -> Result<RepoSyncOutcome, RepoSyncError> {
     log!(
         LogLevel::Trace,
@@ -183,9 +203,16 @@ pub async fn handle_existing_repo(
         }
     }
 
-    // Re-assert ownership every cycle (not just NoChange runs) so drift from
-    // any out-of-band write to the checkout gets caught on the next poll.
-    reassert_checkout_ownership(&auth.generate_id(), git_project_path);
+    // A full re-chown is only worth its I/O cost when the checkout actually
+    // changed this cycle (sync'd or submodules touched new files). On a
+    // NoChange cycle, skip it and rely on the periodic sweep below to still
+    // catch ownership drift from any out-of-band write to the checkout.
+    let now = unix_now();
+    let sweep_due = now.saturating_sub(*last_ownership_check) >= OWNERSHIP_SWEEP_INTERVAL_SECS;
+    if decision.should_update || force_submodule_sync || sweep_due {
+        reassert_checkout_ownership(&auth.generate_id(), git_project_path);
+        *last_ownership_check = now;
+    }
 
     Ok(outcome)
 }
@@ -1475,7 +1502,7 @@ mod integration_tests {
         let checkout = sandbox.checkout_path("widgets");
         sandbox.clone_checkout(&bare, "main", &checkout).await;
 
-        let outcome = handle_existing_repo(&auth, &checkout, false)
+        let outcome = handle_existing_repo(&auth, &checkout, false, &mut 0u64)
             .await
             .map_err(|e| e.error)
             .expect("sync should succeed");
@@ -1497,7 +1524,7 @@ mod integration_tests {
             .commit_to_origin(&bare, "main", &[("b.txt", "b")], "add b")
             .await;
 
-        let outcome = handle_existing_repo(&auth, &checkout, false)
+        let outcome = handle_existing_repo(&auth, &checkout, false, &mut 0u64)
             .await
             .map_err(|e| e.error)
             .expect("sync should succeed");
@@ -1527,7 +1554,7 @@ mod integration_tests {
         )
         .await;
 
-        let outcome = handle_existing_repo(&auth, &checkout, false)
+        let outcome = handle_existing_repo(&auth, &checkout, false, &mut 0u64)
             .await
             .map_err(|e| e.error)
             .expect("sync should succeed");
@@ -1555,7 +1582,7 @@ mod integration_tests {
         std::fs::write(checkout_dir(&checkout).join("a.txt"), "modified locally")
             .expect("simulate local drift");
 
-        let outcome = handle_existing_repo(&auth, &checkout, false)
+        let outcome = handle_existing_repo(&auth, &checkout, false, &mut 0u64)
             .await
             .map_err(|e| e.error)
             .expect("sync should succeed");
@@ -1593,7 +1620,7 @@ mod integration_tests {
         )
         .await;
 
-        let err = match handle_existing_repo(&auth, &checkout, false).await {
+        let err = match handle_existing_repo(&auth, &checkout, false, &mut 0u64).await {
             Ok(_) => panic!("fetch should fail against an unreachable remote"),
             Err(err) => err,
         };
