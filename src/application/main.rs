@@ -11,7 +11,7 @@ use artisan_middleware::{
         },
         log,
     },
-    git_actions::{generate_git_project_id, generate_git_project_path, GitAuth, GitCredentials},
+    git_actions::{generate_git_project_path, GitAuth, GitCredentials},
     resource_monitor::ResourceMonitorLock,
     state_persistence::{log_error, update_state, AppState, StatePersistence},
 };
@@ -335,7 +335,7 @@ async fn run_worker_cycle(
     rng: &mut StdRng,
     cycle_state: &mut WorkerCycleState,
 ) -> u64 {
-    let repo_id = generate_git_project_id(git_item);
+    let repo_id = git_item.generate_id();
     let result: Result<RepoSyncOutcome, ErrorArrayItem> = match inspect_repo_checkout(
         git_item,
         git_project_path,
@@ -571,7 +571,7 @@ async fn spawn_git_workers(
         log!(
             LogLevel::Debug,
             "Deploying working thread for: {}",
-            generate_git_project_id(&git_item)
+            git_item.generate_id()
         );
         let delay = rng.random_range(0..INITIAL_WORKER_JITTER_MAX_SECS_EXCLUSIVE);
         let st = state.clone();

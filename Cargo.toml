@@ -4,8 +4,12 @@ version = "2.6.2"
 edition = "2024"
 
 [dependencies]
-#artisan_middleware = "^6.0.0"
-artisan_middleware = {path = "/opt/artisan/lib/artisan_lib"} # local dev path; doesn't resolve on this machine, switched to registry version to build/test here
+#artisan_middleware = "7.0.0"
+# TEMPORARY local path for the resource-taxonomy migration -- 7.0.0 isn't
+# published yet. The /opt/artisan/lib/artisan_lib path this used to point at
+# doesn't exist on a dev machine either way. MUST be reverted to the
+# registry pin above before this is ever pushed/merged.
+artisan_middleware = { path = "../../Libraries/artisan_lib" }
 config = "0.15.25"
 serde = "1.0.229"
 serde_json = "1.0.128"
