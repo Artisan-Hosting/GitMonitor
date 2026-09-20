@@ -4,7 +4,8 @@ version = "2.6.2"
 edition = "2024"
 
 [dependencies]
-artisan_middleware = "7.0.0"
+# This repo needs the local path on its deployed systems
+artisan_middleware = {path = "/opt/artisan/lib/artisan_lib"} 
 config = "0.15.25"
 serde = "1.0.229"
 serde_json = "1.0.128"
