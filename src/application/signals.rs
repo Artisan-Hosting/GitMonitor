@@ -1,5 +1,4 @@
-use dusa_collection_utils::log;
-use dusa_collection_utils::logger::LogLevel;
+use artisan_middleware::dusa_collection_utils::{core::logger::LogLevel, log};
 use signal_hook::{
     consts::{signal::SIGHUP, SIGUSR1},
     iterator::Signals,

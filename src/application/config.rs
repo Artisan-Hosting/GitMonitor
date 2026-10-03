@@ -1,16 +1,66 @@
 use artisan_middleware::aggregator::{Metrics, Status};
 use artisan_middleware::config::AppConfig;
+use artisan_middleware::dusa_collection_utils::core::logger::{set_log_level, LogLevel};
+use artisan_middleware::dusa_collection_utils::core::types::pathtype::PathType;
+use artisan_middleware::dusa_collection_utils::core::types::stringy::Stringy;
+use artisan_middleware::dusa_collection_utils::core::version::{
+    SoftwareVersion, Version, VersionCode,
+};
+use artisan_middleware::dusa_collection_utils::log;
 use artisan_middleware::resource_monitor::ResourceMonitorLock;
 use artisan_middleware::state_persistence::{self, update_state, AppState, StatePersistence};
 use artisan_middleware::timestamp::current_timestamp;
 use artisan_middleware::version::{aml_version, str_to_version};
-use dusa_collection_utils::log;
-use dusa_collection_utils::logger::{set_log_level, LogLevel};
-use dusa_collection_utils::types::pathtype::PathType;
-use dusa_collection_utils::types::stringy::Stringy;
-use dusa_collection_utils::version::{SoftwareVersion, Version, VersionCode};
+use std::fs;
+
+const DEFAULT_APP_CONFIG_DIR: &str = "/etc/ais_gitmon";
+const ERROR_LOG_MAX_SIZE: usize = 5;
+
+/// Caps `state.error_log` in place. The library's own `log_error()` pushes
+/// to this vec via a raw, uncapped `update_state()`, so a run of consecutive
+/// failures across many repo workers can otherwise grow it unbounded between
+/// [`update_state_wrapper`] heartbeats.
+pub fn truncate_error_log(state: &mut AppState) {
+    if state.error_log.len() > ERROR_LOG_MAX_SIZE {
+        state.data = format!(
+            "The error log has a legnth of {}. Truncating...",
+            state.error_log.len()
+        );
+        state.error_log.truncate(ERROR_LOG_MAX_SIZE);
+    }
+}
+
+/// Root directory for this app's git config/state. Overridable via
+/// `AIS_GITMON_CONFIG_DIR` so tests can run against a hermetic temp
+/// directory instead of the real system path.
+pub fn app_config_dir() -> String {
+    std::env::var("AIS_GITMON_CONFIG_DIR").unwrap_or_else(|_| DEFAULT_APP_CONFIG_DIR.to_string())
+}
+
+/// Path to the git global-config file this app manages (safe.directory
+/// entries, etc.). See [`app_config_dir`] for the override mechanism.
+pub fn app_git_config_path() -> String {
+    format!("{}/gitconfig", app_config_dir())
+}
 
 pub fn get_config() -> AppConfig {
+    if let Ok(content) = fs::read_to_string("runtime.toml") {
+        if let Ok(env_v2) = toml::from_str::<artisan_middleware::enviornment::definitions::Enviornment_V2>(&content) {
+            log!(LogLevel::Info, "Loaded gitmon configuration from Environment V2 (runtime.toml)");
+            return AppConfig {
+                app_name: env_v2.app_name,
+                max_ram_usage: env_v2.max_ram_usage,
+                max_cpu_usage: env_v2.max_cpu_usage,
+                environment: env_v2.environment.to_string(),
+                debug_mode: env_v2.debug_mode,
+                log_level: env_v2.log_level,
+                git: env_v2.git,
+                database: None,
+                aggregator: env_v2.aggregator,
+            };
+        }
+    }
+
     let mut config: AppConfig = match AppConfig::new() {
         Ok(loaded_data) => loaded_data,
         Err(e) => {
@@ -82,6 +132,16 @@ pub async fn generate_state(config: &AppConfig) -> AppState {
             state.last_updated = current_timestamp();
             state.config.log_level = config.log_level;
             state.config.environment = config.environment.clone();
+            state.version = {
+                let library_version: Version = aml_version();
+                let software_version: Version =
+                    str_to_version(env!("CARGO_PKG_VERSION"), Some(VersionCode::Production));
+
+                SoftwareVersion {
+                    application: software_version,
+                    library: library_version,
+                }
+            };
             if config.debug_mode == true {
                 set_log_level(LogLevel::Debug);
             }
@@ -94,6 +154,93 @@ pub async fn generate_state(config: &AppConfig) -> AppState {
 
 pub fn get_state_path(config: &AppConfig) -> PathType {
     state_persistence::StatePersistence::get_state_path(&config)
+}
+
+pub fn get_git_token_file() -> Option<String> {
+    if let Ok(contents) = fs::read_to_string("runtime.toml") {
+        if let Some(path) = parse_token_file_path(&contents) {
+            return Some(path);
+        }
+    }
+
+    let contents = match fs::read_to_string("Overrides.toml") {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(err) => {
+            log!(
+                LogLevel::Warn,
+                "Failed to read Overrides.toml while locating the GitHub token file: {}",
+                err
+            );
+            return None;
+        }
+    };
+
+    parse_token_file_path(&contents)
+}
+
+// Split out from `get_git_token_file` so the parsing logic can be
+// regression-tested without touching the process's CWD or the filesystem.
+fn parse_token_file_path(contents: &str) -> Option<String> {
+    // `contents.parse::<toml::Value>()` uses `toml::Value`'s own `FromStr`,
+    // which only accepts a single bare value (a string, a number, an inline
+    // table, ...), not a full multi-line document -- a real Overrides.toml
+    // (which starts with a `#` comment) fails to parse there and this
+    // function would incorrectly report no token_file configured, silently
+    // falling back to `gh auth token`. `toml::from_str` parses a whole
+    // document, which is what Overrides.toml actually is. See the same
+    // footgun documented in `auth::parse_token`.
+    let parsed = match toml::from_str::<toml::Value>(contents) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            log!(
+                LogLevel::Warn,
+                "Failed to parse Overrides.toml while locating the GitHub token file: {}",
+                err
+            );
+            return None;
+        }
+    };
+
+    parsed
+        .get("git")
+        .and_then(|git| git.get("token_file"))
+        .and_then(toml::Value::as_str)
+        .map(str::to_string)
+}
+
+#[cfg(test)]
+mod token_file_path_tests {
+    use super::parse_token_file_path;
+
+    #[test]
+    fn parses_token_file_with_leading_comment() {
+        let contents = "# Overrides for the default config from the lib\n\n\
+             debug_mode = true\n\
+             log_level = \"Info\"\n\
+             \n\
+             [git]\n\
+             default_server = \"GitHub\"\n\
+             credentials_file = \"/tmp/git.recs\"\n\
+             token_file = \"/tmp/github.token\"\n";
+
+        assert_eq!(
+            parse_token_file_path(contents),
+            Some("/tmp/github.token".to_string())
+        );
+    }
+
+    #[test]
+    fn returns_none_when_git_section_missing_token_file() {
+        let contents = "[git]\ndefault_server = \"GitHub\"\n";
+        assert_eq!(parse_token_file_path(contents), None);
+    }
+
+    #[test]
+    fn returns_none_on_malformed_toml() {
+        let contents = "# comment\n[git\ntoken_file = \"/tmp/github.token\"\n";
+        assert_eq!(parse_token_file_path(contents), None);
+    }
 }
 
 pub async fn update_state_wrapper(
@@ -116,14 +263,7 @@ pub async fn update_state_wrapper(
         }
     }
 
-    let error_array_max_size = 5;
-    if state.error_log.len().gt(&error_array_max_size) {
-        state.data = format!(
-            "The error log has a legnth of {}. Truncating...",
-            state.error_log.len()
-        );
-        state.error_log.truncate(error_array_max_size);
-    }
+    truncate_error_log(state);
 
     update_state(state, &path, metrics).await;
 }
