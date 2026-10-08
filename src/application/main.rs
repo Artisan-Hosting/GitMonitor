@@ -925,3 +925,5 @@ mod soak_tests {
         assert_eq!(cycle_state.consecutive_failures, 0);
     }
 }
+
+mod credentials;
