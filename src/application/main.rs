@@ -926,4 +926,281 @@ mod soak_tests {
     }
 }
 
+// Long-running tests that drive `run_worker_cycle` -- the exact state
+// machine `repo_worker` runs in production -- against a real, live-updating
+// local git repo. Both #[ignore]d by default so `cargo test` stays fast;
+// run explicitly with `cargo test -- --ignored <name>`.
+#[cfg(test)]
+mod soak_tests {
+    use super::*;
+    use crate::test_support::{can_chown_to_www_data, run_git_output, Sandbox};
+    use artisan_middleware::{
+        aggregator::Status, config::AppConfig,
+        dusa_collection_utils::core::version::SoftwareVersion,
+    };
+    use serial_test::serial;
+    use std::path::PathBuf;
+
+    fn test_app_state() -> AppState {
+        AppState {
+            name: "gitmon-soak-test".to_string(),
+            version: SoftwareVersion::dummy(),
+            data: String::new(),
+            status: Status::Running,
+            pid: std::process::id(),
+            last_updated: 0,
+            stared_at: 0,
+            event_counter: 0,
+            error_log: Vec::new(),
+            config: AppConfig::dummy(),
+            system_application: false,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }
+    }
+
+    fn checkout_dir(checkout: &PathType) -> PathBuf {
+        PathBuf::from(checkout.to_string())
+    }
+
+    /// Runs `run_worker_cycle` in a loop, sleeping `poll_interval` between
+    /// cycles (instead of the cycle's own computed backoff/refresh wait --
+    /// that's what makes this "fast": it's testing the sync/self-heal state
+    /// machine over many cycles, not the real timing), until `condition`
+    /// returns true or `max_cycles` is reached. Returns whether it converged.
+    async fn run_cycles_until(
+        auth: &GitAuth,
+        checkout: &PathType,
+        state: &Arc<Mutex<AppState>>,
+        state_path: &PathType,
+        rng: &mut StdRng,
+        cycle_state: &mut WorkerCycleState,
+        poll_interval: Duration,
+        max_cycles: u32,
+        condition: impl Fn(&AppState) -> bool,
+    ) -> bool {
+        for _ in 0..max_cycles {
+            run_worker_cycle(auth, checkout, state, state_path, &None, rng, cycle_state).await;
+            if condition(&*state.lock().await) {
+                return true;
+            }
+            sleep(poll_interval).await;
+        }
+        condition(&*state.lock().await)
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[ignore = "long-running soak test; run explicitly with `cargo test -- --ignored soak_tracks_repo_fast`"]
+    async fn soak_tracks_repo_fast() {
+        let sandbox = Sandbox::new();
+        let bare = sandbox
+            .seed_origin("acme", "widgets", "main", &[("a.txt", "a")])
+            .await;
+        let auth = sandbox.git_auth("acme", "widgets", "main");
+        let checkout = sandbox.checkout_path("widgets");
+        sandbox.clone_checkout(&bare, "main", &checkout).await;
+
+        let state = Arc::new(Mutex::new(test_app_state()));
+        let state_path = PathType::from(sandbox.path().join("state.toml"));
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut cycle_state = WorkerCycleState::default();
+
+        // Cycle 1: freshly cloned, nothing changed upstream yet.
+        run_worker_cycle(
+            &auth,
+            &checkout,
+            &state,
+            &state_path,
+            &None,
+            &mut rng,
+            &mut cycle_state,
+        )
+        .await;
+        {
+            let s = state.lock().await;
+            assert!(
+                s.data.contains("state=ready"),
+                "expected an up-to-date report on the first cycle, got: {}",
+                s.data
+            );
+        }
+
+        // Simulate three separate rounds of upstream activity, each observed
+        // within a handful of fast polling cycles -- this is the heart of
+        // "track a repo for a while": real commits, made concurrently with
+        // the same polling loop production uses, actually get picked up.
+        for round in 1..=3 {
+            let file = format!("round-{}.txt", round);
+            let new_sha = sandbox
+                .commit_to_origin(
+                    &bare,
+                    "main",
+                    &[(&file, "content")],
+                    &format!("round {}", round),
+                )
+                .await;
+
+            let converged = run_cycles_until(
+                &auth,
+                &checkout,
+                &state,
+                &state_path,
+                &mut rng,
+                &mut cycle_state,
+                Duration::from_millis(100),
+                20,
+                |s| s.data.contains("state=synced"),
+            )
+            .await;
+            assert!(
+                converged,
+                "round {}: never observed the upstream commit",
+                round
+            );
+
+            let head = run_git_output(&checkout_dir(&checkout), &["rev-parse", "HEAD"]).await;
+            assert_eq!(
+                head.trim(),
+                new_sha,
+                "round {}: HEAD didn't advance to the new commit",
+                round
+            );
+            assert!(
+                checkout_dir(&checkout).join(&file).exists(),
+                "round {}: new file wasn't checked out",
+                round
+            );
+        }
+
+        // Self-healing: corrupt the checkout mid-run and confirm the same
+        // polling loop notices and recovers, without any special-casing.
+        // Needs www-data + chown privileges (see can_chown_to_www_data),
+        // which most dev machines won't have -- skip gracefully rather than
+        // failing on an environment gap unrelated to the sync logic itself.
+        if can_chown_to_www_data() {
+            std::fs::remove_file(checkout_dir(&checkout).join(".git").join("HEAD"))
+                .expect("corrupt the checkout for the self-heal check");
+
+            let healed = run_cycles_until(
+                &auth,
+                &checkout,
+                &state,
+                &state_path,
+                &mut rng,
+                &mut cycle_state,
+                Duration::from_millis(100),
+                20,
+                |s| s.data.contains("state=recreated"),
+            )
+            .await;
+            assert!(
+                healed,
+                "worker cycle never self-healed the corrupted checkout"
+            );
+            assert!(
+                checkout_dir(&checkout).join("round-3.txt").exists(),
+                "recreated checkout should still have the latest content"
+            );
+        } else {
+            eprintln!(
+                "soak_tracks_repo_fast: skipping self-heal portion, cannot chown to www-data on this machine"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[ignore = "long-running soak test using real production timing (30-90s+); run explicitly with `cargo test -- --ignored soak_tracks_repo_real_timing`"]
+    async fn soak_tracks_repo_real_timing() {
+        let sandbox = Sandbox::new();
+        let bare = sandbox
+            .seed_origin("acme", "widgets", "main", &[("a.txt", "a")])
+            .await;
+        let auth = sandbox.git_auth("acme", "widgets", "main");
+        let checkout = sandbox.checkout_path("widgets");
+        sandbox.clone_checkout(&bare, "main", &checkout).await;
+
+        let state = Arc::new(Mutex::new(test_app_state()));
+        let state_path = PathType::from(sandbox.path().join("state.toml"));
+        let mut rng = StdRng::seed_from_u64(7);
+        let mut cycle_state = WorkerCycleState::default();
+
+        // A healthy cycle's wait must be the real HEALTHY_REFRESH_* window,
+        // not a test-shortened one -- and the loop must actually honor it,
+        // exactly like repo_worker's real loop does.
+        let wait = run_worker_cycle(
+            &auth,
+            &checkout,
+            &state,
+            &state_path,
+            &None,
+            &mut rng,
+            &mut cycle_state,
+        )
+        .await;
+        assert!(
+            (HEALTHY_REFRESH_MIN_SECS..HEALTHY_REFRESH_MAX_SECS_EXCLUSIVE).contains(&wait),
+            "healthy cycle wait {} outside the real production window",
+            wait
+        );
+        sleep(Duration::from_secs(wait)).await;
+
+        // Induce one real failure (unreadable origin) and confirm the
+        // returned wait matches the real first-failure backoff window,
+        // then actually wait it out and confirm the next cycle recovers.
+        std::fs::remove_dir_all(&bare).expect("break the origin to induce a real failure");
+        let wait = run_worker_cycle(
+            &auth,
+            &checkout,
+            &state,
+            &state_path,
+            &None,
+            &mut rng,
+            &mut cycle_state,
+        )
+        .await;
+        assert!(
+            (ERROR_RETRY_BASE_SECS..=(ERROR_RETRY_BASE_SECS + ERROR_RETRY_BASE_SECS / 2))
+                .contains(&wait),
+            "first-failure wait {} outside the real production window",
+            wait
+        );
+        {
+            let s = state.lock().await;
+            assert!(
+                s.data.contains("state=error"),
+                "expected an error report, got: {}",
+                s.data
+            );
+        }
+        sleep(Duration::from_secs(wait)).await;
+
+        // Restore the origin and confirm the very next cycle recovers
+        // cleanly (consecutive_failures resets, back to a healthy wait).
+        sandbox
+            .seed_origin("acme", "widgets", "main", &[("a.txt", "a")])
+            .await;
+        // seed_origin recreates the bare repo at the same path, but the
+        // checkout's fetch needs the origin's objects; a fresh fetch will
+        // simply find the same history again since content is identical.
+        let wait = run_worker_cycle(
+            &auth,
+            &checkout,
+            &state,
+            &state_path,
+            &None,
+            &mut rng,
+            &mut cycle_state,
+        )
+        .await;
+        assert!(
+            (HEALTHY_REFRESH_MIN_SECS..HEALTHY_REFRESH_MAX_SECS_EXCLUSIVE).contains(&wait),
+            "post-recovery wait {} should be back in the healthy window",
+            wait
+        );
+        assert_eq!(cycle_state.consecutive_failures, 0);
+    }
+}
+
 mod credentials;
